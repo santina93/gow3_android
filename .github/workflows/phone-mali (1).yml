@@ -1,0 +1,1476 @@
+# Experimental Mali/PanVK renderer, test 2: shared wave64 and frame diagnostics.
+# Test1 passed its buffer probe on the user phone. Test2 has not yet been built/run.
+# Test2 adds a shared wave64 primitive probe and synchronous rendering diagnostics.
+# Upload as .github/workflows/phone-mali.yml on your fork's default android branch.
+# Start a NEW "GOW3 Mali PanVK experimental build (Test 2)" run after committing it.
+# Downloads upstream v2.1.7-bionic-v1 and applies its complete embedded patch.
+# Success artifact: GOW3-Mali-PanVK-test2-apk. Install GOW3-Mali-PanVK-test2.apk.
+# Separate app: God of War III Mali Test 2 / com.gow3.android.bionic.malitest2.
+# Failure artifact: GOW3-Mali-PanVK-build-logs. No signing secrets needed.
+# The fallback is automatic when sparse buffer features/queue are unavailable.
+# Retains the previous unmapped-submodule, Linux and SDK 36 build fixes.
+name: GOW3 Mali PanVK experimental build (Test 2)
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOW3_JOBS: '2'
+      GOW3_ANDROID_API: '30'
+      GOW3_BUILD_TOOLS: 36.0.0
+    steps:
+    - name: Get the matching upstream source without automatic submodules
+      run: |
+        git clone --depth 1 --single-branch --branch v2.1.7-bionic-v1                   --no-recurse-submodules https://github.com/zFitness/gow3_android.git .
+    - name: Record the source version
+      run: |
+        mkdir -p out/phone-build
+        git rev-parse HEAD > out/phone-build/source-commit.txt
+        git config -f .gitmodules --get-regexp '^submodule\..*\.url$'                   > out/phone-build/submodule-urls.txt
+    - name: Skip unmapped gitlinks and fetch the build submodules
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        import subprocess
+        result = subprocess.run(
+            ['git', 'config', '-f', '.gitmodules', '--get-regexp',
+             r'^submodule\..*\.path$'],
+            check=True, capture_output=True, text=True)
+        declared = {line.split(None, 1)[1] for line in result.stdout.splitlines()}
+        entries = subprocess.check_output(['git', 'ls-files', '--stage', '-z'])
+        skipped = []
+        for entry in entries.split(b'\0'):
+            if not entry:
+                continue
+            metadata, raw_path = entry.split(b'\t', 1)
+            path = raw_path.decode('utf-8')
+            if metadata.split()[0] == b'160000' and path not in declared:
+                # Only the temporary runner's index is changed. No commit,
+                # push, or deletion of files in the user's fork is performed.
+                subprocess.run(['git', 'update-index', '--force-remove', '--', path],
+                               check=True)
+                skipped.append(path)
+        Path('out/phone-build/skipped-gitlinks.txt').write_text(
+            ''.join(path + '\n' for path in skipped))
+        print('Skipped gitlinks without .gitmodules mappings:', skipped)
+        PY
+
+        # Restrict both update and status to the seven build dependencies.
+        modules=(
+          third_party/FEX
+          third_party/LibAtrac9
+          gpu/third_party/fsr-vulkan
+          gpu/third_party/imgui
+          gpu/third_party/magic_enum
+          gpu/third_party/miniz
+          gpu/third_party/xbyak
+        )
+        git submodule update --init --recursive -- "${modules[@]}"                   2>&1 | tee out/phone-build/submodule-checkout.log
+        git submodule status --recursive -- "${modules[@]}"                   > out/phone-build/submodules.txt
+    - name: Set up Java
+      uses: actions/setup-java@v6
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Install native build tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends                   build-essential clang lld llvm cmake ninja-build pkg-config                   git curl unzip xz-utils zlib1g-dev libzstd-dev libssl-dev                   glslang-tools spirv-tools bison flex nasm autoconf automake libtool
+    - name: Set up the pinned Android tools
+      uses: android-actions/setup-android@v4
+      with:
+        packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;29.0.14206865
+        log-accepted-android-sdk-licenses: 'false'
+    - name: Configure the SDK and NDK locations
+      run: |
+        sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+        test -n "$sdk"
+        test -f "$sdk/platforms/android-36/android.jar"
+        test -x "$sdk/build-tools/36.0.0/apksigner"
+        test -f "$sdk/ndk/29.0.14206865/build/cmake/android.toolchain.cmake"
+        {
+          echo "ANDROID_HOME=$sdk"
+          echo "ANDROID_SDK_ROOT=$sdk"
+          echo "GOW3_ANDROID_SDK=$sdk"
+          echo "GOW3_NDK=$sdk/ndk/29.0.14206865"
+        } >> "$GITHUB_ENV"
+    - name: Apply Mali buffer backend and run host and shader checks
+      run: "python3 - <<'PY'\nimport hashlib\nfrom pathlib import Path\npatch = r'''--- a/.github/workflows/android.yml\n\
+        +++ b/.github/workflows/android.yml\n@@ -41,6 +41,28 @@\n           python -m unittest \\\n            \
+        \ discover -s tests -p 'test_android_*.py'\n           python -m py_compile tools/android/*.py\n+\n+   \
+        \   - name: Check GPU initialization error handling\n+        run: |\n+          c++ -std=c++23 -O2 -DNDEBUG\
+        \ -Wall -Wextra -Werror -I gpu/shim \\\n+            tests/test_gpu_init_guard.cpp -o \"$RUNNER_TEMP/test_gpu_init_guard\"\
+        \n+          \"$RUNNER_TEMP/test_gpu_init_guard\"\n+\n+      - name: Check ordinary buffer range migration\
+        \ and snapshot copies\n+        run: |\n+          c++ -std=c++23 -O2 -DNDEBUG -Wall -Wextra -Werror -I\
+        \ gpu/shadps4 \\\n+            tests/test_dense_buffer_map.cpp -o \"$RUNNER_TEMP/test_dense_buffer_map\"\
+        \n+          \"$RUNNER_TEMP/test_dense_buffer_map\"\n+\n+      - name: Check wave64 guest layout and diagnostic\
+        \ settings\n+        run: |\n+          c++ -std=c++23 -O2 -DNDEBUG -Wall -Wextra -Werror -I gpu/shadps4\
+        \ \\\n+            tests/test_wave64_layout.cpp -o \"$RUNNER_TEMP/test_wave64_layout\"\n+          \"$RUNNER_TEMP/test_wave64_layout\"\
+        \n+          c++ -std=c++23 -O2 -UNDEBUG -Wall -Wextra -Werror -I gpu/shim \\\n+            tests/test_graphics_settings.cpp\
+        \ gpu/shim/gow3_settings.cpp \\\n+            -o \"$RUNNER_TEMP/test_graphics_settings\"\n+          \"\
+        $RUNNER_TEMP/test_graphics_settings\"\n \n   release:\n     name: Build signed Android release\n--- /dev/null\n\
+        +++ b/BLACK-SCREEN-ANALYSIS.txt\n@@ -0,0 +1,30 @@\n+Observed evidence from GodOfWar3-Logs-20261018-112702.zip\n\
+        +\n+Phone: OPPO CPH2737 / Android 16 / Mali-G615 MC6 / PanVK-kbase\n+App: 2.1.7-bionic-v1-mali-test1\n+\n\
+        +Confirmed:\n+- dense experimental buffer backend selected\n+- GOW3_MALI_DENSE_BUFFER_PROBE=PASS\n+- presentation\
+        \ connection established, 3 buffers at 1280x720\n+- game modules initialize and game data loads\n+- FSR\
+        \ 3.1 and deferred/stale readbacks enabled\n+- no recorded fatal Vulkan error or shader compilation failure\n\
+        +\n+Not established:\n+- the exact cause of the reported black screen and white artifacts\n+- whether the\
+        \ main scene is submitting correct draws or merely loading\n+- correctness of translated compute/graphics\
+        \ shaders, images or displayed pixels\n+- FPS, thermal behavior or sustained gameplay\n+\n+Source defects\
+        \ addressed in the next experimental build:\n+- hard-coded 32-lane assumptions in logical wave64 emulation\n\
+        +- reliance on native subgroup lane order matching guest thread order\n+- missing single-wave LDS barrier\
+        \ policy on smaller/non-fixed subgroups\n+- storage-buffer visibility for emulated LDS and accounting for\
+        \ native scratch\n+- shader cache invalidation after lowering changes\n+\n+Test 2 adds a mapping-independent\
+        \ shared-memory fallback, a real-driver 8x16\n+primitive probe, conservative startup settings and frame-path\
+        \ diagnostics.\n+This is a candidate rendering correction and investigation build, not a\n+confirmed black-screen\
+        \ fix. Read MALI-PANVK-TEST.md for testing instructions.\n--- /dev/null\n+++ b/MALI-PANVK-TEST.md\n@@ -0,0\
+        \ +1,131 @@\n+# Mali / PanVK Test 2 — black-screen investigation\n+\n+This is an experimental correction\
+        \ and diagnostic build for the OPPO Reno14\n+(CPH2737), Android 16, Mali-G615 MC6 and the imported PanVK-kbase\
+        \ driver.\n+Full gameplay compatibility and performance have not been established.\n+\n+## What your 11:27\
+        \ log proves\n+\n+The installed app is `2.1.7-bionic-v1-mali-test1`. It selects the ordinary-buffer\n+backend,\
+        \ reports `GOW3_MALI_DENSE_BUFFER_PROBE=PASS`, connects to the Android\n+presentation bridge and loads game\
+        \ data. There is no recorded fatal error,\n+device-loss message, out-of-memory report or shader-compilation\
+        \ failure that\n+identifies the cause of the black screen. FSR 3.1 and stale/deferred readbacks\n+are enabled\
+        \ in this run.\n+\n+The SDL disk-audio messages are from the intended PCM FIFO audio bridge. The\n+layer-enumeration\
+        \ message ending in `Success` is also not the failure that\n+stopped the previous APK: initialization and\
+        \ the GPU probe continued after it.\n+The format and optional-extension warnings are capability reports,\
+        \ not proof\n+that those formats or extensions caused this scene to fail.\n+\n+## Changes in Test 2\n+\n\
+        +The old compute wave64 lowering hard-coded 32-lane native groups. Vulkan does\n+not guarantee that native\
+        \ subgroup lane IDs match linear workgroup indices:\n+\n+https://docs.vulkan.org/refpages/latest/refpages/source/SubgroupLocalInvocationId.html\n\
+        +\n+Test 2 indexes temporary shared memory by guest invocation instead. It builds\n+logical 64-lane ballot\
+        \ masks with atomic bit operations, implements peer and\n+uniform first-lane reads with one shared word\
+        \ per guest thread, repairs logical\n+lane IDs and handles partial waves. It uses barriers between phases\
+        \ and avoids\n+adding workgroup barriers inside the divergent regions identified by the pass.\n+Non-uniform\
+        \ cross-wave operations remain a limitation; the existing warnings\n+remain available for further diagnosis.\
+        \ Scratch memory is bounded by the\n+reported device limit; it can cost up to four bytes per rounded guest\
+        \ thread.\n+\n+Compute wave64 is treated as native only when pipeline creation explicitly\n+requests a supported\
+        \ size of 64 for the compute stage. Other compute paths use\n+the shared-memory fallback. Single-wave LDS\
+        \ synchronization now also covers\n+these paths. A shader-backend revision field invalidates old serialized\
+        \ shaders.\n+\n+For guest shared memory moved into a storage buffer, the barrier pass now\n+recognizes those\
+        \ accesses and generated control barriers include UniformMemory\n+semantics. Native scratch allocation excludes\
+        \ that spilled guest storage, so it\n+does not reserve physical shared memory for the same data a second\
+        \ time.\n+\n+https://docs.vulkan.org/spec/latest/appendices/memorymodel.html\n+\n+A new real-driver primitive\
+        \ probe uses a two-dimensional 8x16 workgroup to check\n+two logical wave64 ballots, reads across subgroup\
+        \ boundaries and barriers for\n+both native shared memory and storage-buffer emulation. It complements the\
+        \ existing ordinary-buffer probe. It does not execute\n+a translated game shader and does not prove gameplay\
+        \ correctness.\n+\n+The diagnostic build temporarily starts with temporal upscaling off, synchronous\n+shader\
+        \ compilation, synchronous image readbacks and one queued frame. These\n+startup overrides do not rewrite\
+        \ the stored INI when settings load. The external\n+launcher may still show your saved choices; the diagnostic\
+        \ line in the log shows\n+the settings actually applied to this test process. Runtime menu changes can\n\
+        +still save settings through the existing menu behavior.\n+\n+Additional logs distinguish game-frame preparation,\
+        \ commands recorded, frames\n+sent to the app and the app's receive counter. Receive/sent counters establish\n\
+        +progress in the frame path; they do not measure whether the displayed pixels\n+are correct.\n+\n+These\
+        \ changes address concrete portability defects and narrow the remaining\n+failure. The uploaded log alone\
+        \ does not prove they explain the whole black\n+screen. No confirmed visual fix or performance improvement\
+        \ is claimed.\n+\n+## Build and test from Android\n+\n+1. Replace `.github/workflows/phone-mali.yml` in\
+        \ your fork's default `android`\n+   branch with the accompanying updated `phone-mali.yml`. Commit it.\n\
+        +2. Open Actions, select **GOW3 Mali PanVK experimental build (Test 2)**, and start\n+   a new **Run workflow**.\
+        \ Keep `phone-debug.yml` as your earlier backup.\n+3. Download the successful run's **GOW3-Mali-PanVK-test2-apk**\
+        \ artifact. Unzip and\n+   install `GOW3-Mali-PanVK-test2.apk`.\n+4. Open **God of War III Mali Test 2**.\
+        \ Its separate package is\n+   `com.gow3.android.bionic.malitest2`, so it can coexist with Test 1. Select\
+        \ your\n+   game folder and import/select your PanVK ZIP again. Private settings and saves\n+   are separate.\
+        \ Start with 540p and a 30 FPS limit if available.\n+5. Launch and leave it running for about 60 seconds\
+        \ if it stays responsive,\n+   including the black-screen period. Then use **About → EXPORT LOGS** in Test\
+        \ 2\n+   and attach the complete exported ZIP. Say whether you saw a menu or gameplay\n+   and whether the\
+        \ white artifacts changed.\n+\n+The workflow includes the complete patch against upstream `v2.1.7-bionic-v1`.\n\
+        +It retains the Linux, SDK 36 and submodule fixes from your successful Test 1 build.\n+You only need to\
+        \ upload the workflow file; the full source ZIP is for review or\n+development. On failure, download **GOW3-Mali-PanVK-build-logs**\
+        \ from that run.\n+No new PanVK driver is included or required for this comparison.\n+\n+A new clean GitHub\
+        \ runner generates a different debug signing key. A future\n+rebuild of the same Test 2 package may require\
+        \ uninstalling that test app first.\n+Preserve any test saves before doing so.\n+\n+## Expected diagnostic\
+        \ markers\n+\n+- `GOW3_MALI_DIAGNOSTICS=2`: conservative startup settings applied.\n+- `GOW3_MALI_DENSE_BUFFER_PROBE=PASS`:\
+        \ existing buffer primitive test passed.\n+- `GOW3_MALI_WAVE64_PROBE=PASS`: the new shared-memory primitive\
+        \ test passed.\n+- `GOW3_MALI_SHADER_PROFILE`: default hardware subgroup size, native wave64 flag,\n+  LDS\
+        \ barrier selection and shader backend revision.\n+- `GOW3_MALI_FRAME_PREPARE` / `READY` / `SENT`: first\
+        \ eight game frames and samples\n+  every 120 frames, with recorded draw/dispatch counts.\n+- `GOW3_MALI_APP`:\
+        \ frame receive count and child-process liveness about every\n+  five seconds in logcat.\n+\n+The two GPU\
+        \ probes run at startup when the ordinary-buffer backend is selected.\n+A probe failure stops initialization\
+        \ with a clear message. The Test 2 probe has\n+not yet been run on the phone. A PASS still requires testing\
+        \ translated shaders,\n+image handling, presentation, game synchronization and actual gameplay.\n+\n+##\
+        \ Validation and continuing limits\n+\n+Host checks cover 3,132 wave-layout/reference cases with 4/8/16/32/64/128\
+        \ native\n+size inputs, randomized execution order, partial waves and peer reads. The\n+settings test checks\
+        \ that diagnostic overrides apply and loading preserves the\n+saved INI. Existing ordinary-buffer and initialization\
+        \ tests remain included.\n+Exact completed checks and unavailable checks are recorded in VALIDATION.txt.\n\
+        +\n+No Android/NDK toolchain, shader compiler or Mali device is available in this\n+workspace. Full Test\
+        \ 2 native/GLSL compilation runs in the supplied workflow;\n+actual GPU results come from the phone. The\
+        \ host tests exercise layout and scalar\n+reference models, not the full IR pass or Vulkan synchronization.\n\
+        +\n+The first implementation's ordinary-buffer budget, lack of eviction and other\n+shader/format/driver\
+        \ compatibility limits still apply. This test adds shared\n+memory and synchronization costs. Performance\
+        \ optimization needs a correct\n+rendered scene and measurements on the phone.\n--- /dev/null\n+++ b/PANVK-STARTUP-FIX.txt\n\
+        @@ -0,0 +1,3 @@\n+Historical startup-guard patch\n+\n+The startup exception guard remains included. Its\
+        \ former unconditional sparse-buffer rejection has been replaced by the experimental ordinary-buffer backend.\
+        \ Read MALI-PANVK-TEST.md for the current implementation, validation limits and build instructions.\n---\
+        \ /dev/null\n+++ b/VALIDATION.txt\n@@ -0,0 +1,43 @@\n+Mali / PanVK experimental renderer: Test 2\n+Validation\
+        \ date: 2026-10-18\n+\n+Phone evidence received for Test 1:\n+- App 2.1.7-bionic-v1-mali-test1 launched\
+        \ on OPPO CPH2737 / Android 16.\n+- GOW3_MALI_DENSE_BUFFER_PROBE=PASS on the selected PanVK driver.\n+-\
+        \ Display bridge connected and game data loaded.\n+- User reports the initial frame followed by black output\
+        \ and white artifacts.\n+- The log does not identify a definitive fatal rendering error or single cause.\n\
+        +\n+Host checks for Test 2:\n+PASS: Wave64 layout and scalar-reference checks, C++23, optimization/NDEBUG,\n\
+        +      warnings as errors: 3,132 groups with native-size inputs 4/8/16/32/64/128,\n+      randomized execution\
+        \ order, partial waves, ballot masks and peer reads.\n+PASS: AddressSanitizer + UndefinedBehaviorSanitizer\
+        \ version of those checks.\n+      LeakSanitizer disabled because this workspace prevents process inspection.\n\
+        +PASS: Actual graphics-settings implementation test, including applying the\n+      diagnostic startup overrides\
+        \ and preserving saved INI bytes during Load.\n+PASS: Existing Android manifest/packaging Python tests:\
+        \ 13 tests.\n+PASS: Ordinary-buffer range-map and initialization-guard host tests retained.\n+PASS: Modified\
+        \ shell-script syntax and Git whitespace checks.\n+PASS: Standalone workflow YAML and embedded shell/Python\
+        \ syntax checks.\n+PASS: Combined patch application against the pristine supplied tag; every\n+      changed\
+        \ file matches the edited source byte for byte.\n+PASS: Debug/release runtime application identities with\
+        \ placeholder inputs,\n+      including cached debug staging and switching from release back to debug.\n\
+        +\n+Not performed here:\n+- Full Test 2 Vulkan C++ compilation and IR-pass integration tests.\n+- Test 2\
+        \ GLSL/SPIR-V compilation or validation.\n+- GitHub Actions execution, Android/NDK build or APK installation.\n\
+        +- New 8x16 wave64 native/spilled-memory GPU primitive probe on the phone.\n+- Translated game-shader execution,\
+        \ pixel correctness or gameplay verification.\n+- FPS, power, latency, memory-pressure or thermal measurements.\n\
+        +\n+The host wave tests check a layout/reference model. They do not execute the\n+IR lowering pass or prove\
+        \ Vulkan synchronization. The added phone probe checks\n+an equivalent shared-memory primitive; it is not\
+        \ a translated-game test.\n+The workflow runs host/shader validation and the full native Android build.\n\
+        +\n+Test 2 corrects concrete shader-portability assumptions and adds diagnostics.\n+It is not a confirmed\
+        \ black-screen fix or fully compatible Mali renderer.\n+See MALI-PANVK-TEST.md and BLACK-SCREEN-ANALYSIS.txt.\n\
+        --- a/android-launcher/app/build.gradle.kts\n+++ b/android-launcher/app/build.gradle.kts\n@@ -15,20 +15,24\
+        \ @@\n android {\n     namespace = \"com.gow3.android\"\n     compileSdk {\n-        version = release(37)\n\
+        +        version = release(36)\n     }\n \n     defaultConfig {\n         applicationId = \"com.gow3.android.bionic\"\
+        \n         minSdk = 28\n         targetSdk = 28\n-        versionCode = 2\n+        versionCode = 3\n  \
+        \       versionName = \"2.1.7-bionic-v1\"\n \n         testInstrumentationRunner = \"androidx.test.runner.AndroidJUnitRunner\"\
+        \n     }\n \n     buildTypes {\n+        debug {\n+            applicationIdSuffix = \".malitest2\"\n+ \
+        \           versionNameSuffix = \"-mali-test2\"\n+        }\n         release {\n             optimization\
+        \ {\n                 enable = false\n--- a/android-launcher/app/src/androidTest/java/com/gow3/android/ExampleInstrumentedTest.kt\n\
+        +++ b/android-launcher/app/src/androidTest/java/com/gow3/android/ExampleInstrumentedTest.kt\n@@ -19,6 +19,6\
+        \ @@\n     fun useAppContext() {\n         // 被测应用的上下文。\n         val appContext = InstrumentationRegistry.getInstrumentation().targetContext\n\
+        -        assertEquals(\"com.gow3.android.bionic\", appContext.packageName)\n+        assertEquals(BuildConfig.APPLICATION_ID,\
+        \ appContext.packageName)\n     }\n }\n\\ No newline at end of file\n--- /dev/null\n+++ b/android-launcher/app/src/debug/res/values-zh-rCN/strings.xml\n\
+        @@ -0,0 +1,4 @@\n+<?xml version=\"1.0\" encoding=\"utf-8\"?>\n+<resources>\n+    <string name=\"app_name\"\
+        >God of War III Mali Test 2</string>\n+</resources>\n--- /dev/null\n+++ b/android-launcher/app/src/debug/res/values/strings.xml\n\
+        @@ -0,0 +1,4 @@\n+<?xml version=\"1.0\" encoding=\"utf-8\"?>\n+<resources>\n+    <string name=\"app_name\"\
+        >God of War III Mali Test 2</string>\n+</resources>\n--- a/android-launcher/app/src/main/AndroidManifest.xml\n\
+        +++ b/android-launcher/app/src/main/AndroidManifest.xml\n@@ -10,7 +10,7 @@\n         android:allowBackup=\"\
+        false\"\n         android:icon=\"@drawable/icon\"\n         android:isGame=\"true\"\n-        android:label=\"\
+        God of War III\"\n+        android:label=\"@string/app_name\"\n         android:requestLegacyExternalStorage=\"\
+        true\"\n         android:theme=\"@style/GameTheme\">\n         <activity\n--- a/android-launcher/app/src/main/java/ro/cobrabm/fexdroid/GameActivity.java\n\
+        +++ b/android-launcher/app/src/main/java/ro/cobrabm/fexdroid/GameActivity.java\n@@ -73,6 +73,7 @@\n    \
+        \ /** Bionic 下 app 侧 present socket（run-bionic.sh 的 GOW3_PRESENT_SOCKET 同一个）。 */\n     private String presentSocket()\
+        \ { return FILES+\"/gow3present.sock\"; }\n     private boolean drawerOpen, displayOnly, startingX, hadError,\
+        \ swipeConsumed;\n+    private long maliDiagnosticPolls;\n     /** 主页 LAUNCH 传入的单次启动踢动标记：消费一次后即失效（防 Surface\
+        \ 重建静默重启）。 */\n     private boolean launchOnReady;\n     private float touchX, touchY;\n@@ -637,6 +638,11\
+        \ @@\n \n     private void pollFrames() {\n         if (destroyed) return;\n+        if (++maliDiagnosticPolls\
+        \ % 5 == 1) {\n+            final Process current=game;\n+            android.util.Log.i(\"God of War III\"\
+        , \"GOW3_MALI_APP: received_frames=\"+\n+                Gow3Present.framesIfLoaded()+\" game_alive=\"+(current!=null\
+        \ && current.isAlive()));\n+        }\n         if (!hadError && (Gow3Present.framesIfLoaded()>0))\n   \
+        \          status.setVisibility(View.GONE);\n         // run-gow3.sh 在 LSFG 运行时失败、自动回退到普通 Vulkan 时会写这个标记：这时刷新率要退回\n\
+        --- a/android-launcher/app/src/main/res/values-zh-rCN/strings.xml\n+++ b/android-launcher/app/src/main/res/values-zh-rCN/strings.xml\n\
+        @@ -1,6 +1,6 @@\n <?xml version=\"1.0\" encoding=\"utf-8\"?>\n <resources>\n-    <string name=\"app_name\"\
+        >Gow3Launcher</string>\n+    <string name=\"app_name\">God of War III</string>\n \n     <!-- 品牌与关键动作按钮：双语同值，不翻译\
+        \ -->\n     <string name=\"title_god_of_war_iii\">GOD OF WAR III</string>\n--- a/android-launcher/app/src/main/res/values/strings.xml\n\
+        +++ b/android-launcher/app/src/main/res/values/strings.xml\n@@ -1,6 +1,6 @@\n <?xml version=\"1.0\" encoding=\"\
+        utf-8\"?>\n <resources>\n-    <string name=\"app_name\">Gow3Launcher</string>\n+    <string name=\"app_name\"\
+        >God of War III</string>\n \n     <!-- 品牌与关键动作按钮：双语同值，不翻译 -->\n     <string name=\"title_god_of_war_iii\"\
+        >GOD OF WAR III</string>\n--- a/android-launcher/gradle/libs.versions.toml\n+++ b/android-launcher/gradle/libs.versions.toml\n\
+        @@ -1,11 +1,11 @@\n [versions]\n agp = \"9.3.3\"\n-coreKtx = \"1.19.1\"\n+coreKtx = \"1.17.0\"\n junit =\
+        \ \"4.13.2\"\n junitVersion = \"1.3.0\"\n espressoCore = \"3.7.0\"\n-lifecycleRuntimeKtx = \"2.11.0\"\n\
+        -activityCompose = \"1.13.0\"\n+lifecycleRuntimeKtx = \"2.9.4\"\n+activityCompose = \"1.11.0\"\n kotlin\
+        \ = \"2.2.10\"\n composeBom = \"2026.02.01\"\n \n--- a/gpu/CMakeLists.txt\n+++ b/gpu/CMakeLists.txt\n@@\
+        \ -127,6 +127,8 @@\n add_host_shader(ms_image_blit.frag ms_image_blit_frag)\n add_host_shader(ms_image_blit.frag\
+        \ ms_image_blit_msaa_frag SRC_MSAA=1)\n add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)\n\
+        +add_host_shader(dense_buffer_probe.comp dense_buffer_probe_comp)\n+add_host_shader(wave64_probe.comp wave64_probe_comp)\n\
+        \ add_host_shader(fs_tri.vert fs_tri_vert)\n add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)\n add_host_shader(fsr.comp\
+        \ fsr_rcas_comp SAMPLE_RCAS=1)\n--- a/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp\n\
+        +++ b/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp\n@@ -27,6 +27,9 @@\n         memory\
+        \ = spv::Scope::Workgroup;\n         memory_semantics =\n             spv::MemorySemanticsMask::AcquireRelease\
+        \ | spv::MemorySemanticsMask::WorkgroupMemory;\n+        if (ctx.info.HasSpilledSharedMemory()) {\n+   \
+        \         memory_semantics |= spv::MemorySemanticsMask::UniformMemory;\n+        }\n     }\n     ctx.OpControlBarrier(ctx.ConstU32(static_cast<u32>(execution)),\n\
+        \                          ctx.ConstU32(static_cast<u32>(memory)),\n--- a/gpu/shadps4/shader_recompiler/backend/spirv/spirv_emit_context.cpp\n\
+        +++ b/gpu/shadps4/shader_recompiler/backend/spirv/spirv_emit_context.cpp\n@@ -1070,7 +1070,7 @@\n     }\n\
+        \     ASSERT(info.hw_stage == HwStage::Compute);\n     const u32 shared_memory_size =\n-        runtime_info.hw.cs.shared_memory_size\
+        \ + info.shared_memory_scratch_size;\n+        info.NativeSharedMemorySize(runtime_info.hw.cs.shared_memory_size)\
+        \ + info.shared_memory_scratch_size;\n \n     const auto make_type = [&](IR::Type type, Id element_type,\
+        \ u32 element_size,\n                                std::string_view name) {\n--- a/gpu/shadps4/shader_recompiler/info.h\n\
+        +++ b/gpu/shadps4/shader_recompiler/info.h\n@@ -63,6 +63,17 @@\n     UserDataMask ud_mask{};\n     u32 fetch_shader_sgpr_base{};\n\
+        \     u32 shared_memory_scratch_size{};\n+\n+    bool HasSpilledSharedMemory() const {\n+        for (const\
+        \ auto& buffer : buffers) {\n+            if (buffer.buffer_type == BufferType::SharedMemory) return true;\n\
+        +        }\n+        return false;\n+    }\n+\n+    u32 NativeSharedMemorySize(u32 guest_size) const {\n\
+        +        return HasSpilledSharedMemory() ? 0 : guest_size;\n+    }\n \n     u64 pgm_hash{};\n \n--- a/gpu/shadps4/shader_recompiler/ir/passes/lower_wave64_pass.cpp\n\
+        +++ b/gpu/shadps4/shader_recompiler/ir/passes/lower_wave64_pass.cpp\n@@ -8,6 +8,7 @@\n #include \"shader_recompiler/ir/ir_emitter.h\"\
+        \n #include \"shader_recompiler/ir/program.h\"\n #include \"shader_recompiler/profile.h\"\n+#include \"\
+        shader_recompiler/wave64_layout.h\"\n \n namespace Shader::Optimization {\n \n@@ -23,7 +24,9 @@\n      \
+        \                                     return true;\n                                       case IR::Opcode::GetAttributeU32:\n\
+        \                                           if (inst->Arg(0).Attribute() ==\n-                         \
+        \                     IR::Attribute::LocalInvocationId) {\n+                                           \
+        \   IR::Attribute::LocalInvocationId ||\n+                                              inst->Arg(0).Attribute()\
+        \ ==\n+                                              IR::Attribute::LocalInvocationIndex) {\n          \
+        \                                     return true;\n                                           }\n     \
+        \                                      break;\n@@ -86,15 +89,16 @@\n \n void LowerWave64BallotPass(IR::Program&\
+        \ program, const RuntimeInfo& runtime_info,\n                            const Profile& profile) {\n-  \
+        \  if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {\n+    if (program.info.hw_stage\
+        \ != HwStage::Compute || profile.native_compute_wave64) {\n         return;\n     }\n \n     const auto\
+        \ [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;\n     const u32 num_threads = size_x * size_y\
+        \ * size_z;\n-    if (num_threads <= 32) {\n+    if (num_threads == 0) {\n         return;\n     }\n+  \
+        \  const Wave64Layout layout{profile.subgroup_size};\n \n     std::vector<IR::Inst*> worklist;\n     const\
+        \ auto uniform_blocks = FindUniformBlocks(program);\n@@ -109,15 +113,13 @@\n             }\n         };\n\
+        \         for (IR::Inst& inst : block->Instructions()) {\n-            if (inst.GetOpcode() == IR::Opcode::ReadLane\
+        \ && inst.Arg(1).IsImmediate()) {\n+            if (inst.GetOpcode() == IR::Opcode::ReadLane ||\n+     \
+        \           inst.GetOpcode() == IR::Opcode::ReadFirstLane) {\n                 push_worklist(inst);\n  \
+        \           } else if (inst.GetOpcode() == IR::Opcode::Ballot) {\n-                const auto is_unpack\
+        \ = [](const IR::Use& use) {\n-                    return use.user->GetOpcode() == IR::Opcode::UnpackUint2x32;\n\
+        -                };\n-                if (std::ranges::any_of(inst.Uses(), is_unpack)) {\n-            \
+        \        push_worklist(inst);\n-                }\n+                push_worklist(inst);\n+            }\
+        \ else if (inst.GetOpcode() == IR::Opcode::LaneId) {\n+                worklist.push_back(&inst);\n    \
+        \         } else if (inst.GetOpcode() == IR::Opcode::GetAttributeU32 &&\n                        inst.Arg(0).Attribute()\
+        \ == IR::Attribute::SubgroupLtMask) {\n                 worklist.push_back(&inst);\n@@ -128,40 +130,65 @@\n\
+        \         return;\n     }\n \n-    const u32 scratch_base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size,\
+        \ sizeof(u64));\n-    const u32 scratch_size =\n-        (Common::AlignUp(num_threads, 64) / profile.subgroup_size)\
+        \ * sizeof(u32);\n+    const u32 guest_native_shared =\n+        program.info.NativeSharedMemorySize(runtime_info.hw.cs.shared_memory_size);\n\
+        +    const u32 scratch_base = Common::AlignUp(guest_native_shared, sizeof(u64));\n+    const bool needs_scratch\
+        \ = std::ranges::any_of(worklist, [](const IR::Inst* inst) {\n+        return inst->GetOpcode() == IR::Opcode::Ballot\
+        \ || inst->GetOpcode() == IR::Opcode::ReadLane ||\n+               inst->GetOpcode() == IR::Opcode::ReadFirstLane;\n\
+        +    });\n+    const u32 scratch_size = needs_scratch ? layout.ScratchSlots(num_threads) * sizeof(u32) :\
+        \ 0;\n+    ASSERT_MSG(scratch_base + scratch_size <= profile.max_shared_memory_size,\n+               \"\
+        Wave64 emulation needs {} bytes of shared memory; driver limit is {}\",\n+               scratch_base +\
+        \ scratch_size, profile.max_shared_memory_size);\n     program.info.shared_memory_scratch_size =\n-    \
+        \    scratch_base + scratch_size - runtime_info.hw.cs.shared_memory_size;\n+        scratch_base + scratch_size\
+        \ - guest_native_shared;\n \n     for (IR::Inst* inst : worklist) {\n         LOG_INFO(Render_Recompiler,\
+        \ \"Lowering {} instruction for wave64\", inst->GetOpcode());\n         IR::IREmitter ir{*inst->GetParent(),\
+        \ IR::Block::InstructionList::s_iterator_to(*inst)};\n         const IR::U32 invocation_index = ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);\n\
+        -        const IR::U32 subgroup_id = ir.ShiftRightLogical(invocation_index, ir.Imm32(5));\n+        const\
+        \ IR::U32 guest_lane = ir.BitwiseAnd(invocation_index, ir.Imm32(63u));\n+        const IR::U32 wave_first_slot\
+        \ = ir.BitwiseAnd(invocation_index, ir.Imm32(~63u));\n+        const auto slot_address = [&](const IR::U32&\
+        \ slot) {\n+            return IR::U32{ir.IAdd(ir.Imm32(scratch_base),\n+                              \
+        \     ir.ShiftLeftLogical(slot, ir.Imm32(2u)))};\n+        };\n         if (inst->GetOpcode() == IR::Opcode::Ballot)\
+        \ {\n-            const IR::U32 mask_low =\n-                IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(IR::U1{inst->Arg(0)})),\
+        \ 0)};\n-            const IR::U32 offset =\n-                ir.IAdd(ir.Imm32(scratch_base), ir.ShiftLeftLogical(subgroup_id,\
+        \ ir.Imm32(2u)));\n-            ir.WriteShared(32, mask_low, offset);\n-            ir.Barrier();\n-   \
+        \         const IR::U64 mask = IR::U64{ir.LoadShared(64, false, offset)};\n+            const IR::U32 low_address\
+        \ = slot_address(wave_first_slot);\n+            const IR::U32 high_address = slot_address(ir.IAdd(wave_first_slot,\
+        \ ir.Imm32(1u)));\n+            // Every active guest invocation resets its own logical wave's two\n+  \
+        \          // mask words. The barrier separates reset from bit publication.\n+            (void)ir.SharedAtomicAnd(low_address,\
+        \ ir.Imm32(0u), false);\n+            (void)ir.SharedAtomicAnd(high_address, ir.Imm32(0u), false);\n+  \
+        \          ir.Barrier();\n+            const IR::U32 half = ir.ShiftRightLogical(guest_lane, ir.Imm32(5u));\n\
+        +            const IR::U32 bit = ir.ShiftLeftLogical(ir.Imm32(1u),\n+                                  \
+        \                 ir.BitwiseAnd(guest_lane, ir.Imm32(31u)));\n+            const IR::U32 contribution{ir.Select(IR::U1{inst->Arg(0)},\
+        \ bit, ir.Imm32(0u))};\n+            (void)ir.SharedAtomicOr(slot_address(ir.IAdd(wave_first_slot, half)),\
+        \ contribution, false);\n+            ir.Barrier();\n+            const IR::U32 low{ir.LoadShared(32, false,\
+        \ low_address)};\n+            const IR::U32 high{ir.LoadShared(32, false, high_address)};\n+          \
+        \  const IR::U64 mask{ir.PackUint2x32(ir.CompositeConstruct(low, high))};\n             ir.Barrier();\n\
+        \             inst->ReplaceUsesWithAndRemove(mask);\n-        } else if (inst->GetOpcode() == IR::Opcode::ReadLane)\
+        \ {\n-            const IR::U32 lane32 = ir.BitwiseAnd(IR::U32{inst->Arg(1)}, ir.Imm32(31));\n-        \
+        \    const IR::U32 half = ir.ShiftRightLogical(IR::U32{inst->Arg(1)}, ir.Imm32(5u));\n-            const\
+        \ IR::U32 offset =\n-                ir.IAdd(ir.Imm32(scratch_base), ir.ShiftLeftLogical(subgroup_id, ir.Imm32(2u)));\n\
+        -            ir.WriteShared(32, ir.ReadLane(IR::U32{inst->Arg(0)}, lane32), offset);\n-            ir.Barrier();\n\
+        -            const IR::U32 value =\n-                IR::U32{ir.LoadShared(32, false,\n-               \
+        \                       ir.IAdd(ir.BitwiseAnd(offset, ir.Imm32(~7u)),\n-                               \
+        \               ir.ShiftLeftLogical(half, ir.Imm32(2u))))};\n+        } else if (inst->GetOpcode() == IR::Opcode::ReadLane\
+        \ ||\n+                   inst->GetOpcode() == IR::Opcode::ReadFirstLane) {\n+            // At these workgroup-uniform\
+        \ sites logical lane zero is active.\n+            const IR::U32 selected_lane = inst->GetOpcode() == IR::Opcode::ReadFirstLane\n\
+        +                ? ir.Imm32(0u) : IR::U32{ir.BitwiseAnd(IR::U32{inst->Arg(1)}, ir.Imm32(63u))};\n+     \
+        \       // One writer per guest slot: no physical lane-number assumption and\n+            // no concurrent\
+        \ ordinary stores to the same word.\n+            ir.WriteShared(32, inst->Arg(0), slot_address(invocation_index));\n\
+        +            ir.Barrier();\n+            const IR::U32 source_slot =\n+                ir.IAdd(wave_first_slot,\
+        \ selected_lane);\n+            const IR::U32 value{ir.LoadShared(32, false, slot_address(source_slot))};\n\
+        \             ir.Barrier();\n             inst->ReplaceUsesWithAndRemove(value);\n+        } else if (inst->GetOpcode()\
+        \ == IR::Opcode::LaneId) {\n+            inst->ReplaceUsesWithAndRemove(ir.BitwiseAnd(invocation_index,\
+        \ ir.Imm32(63u)));\n         } else if (inst->GetOpcode() == IR::Opcode::GetAttributeU32 &&\n          \
+        \          inst->Arg(0).Attribute() == IR::Attribute::SubgroupLtMask) {\n             const IR::U32 subgroup_invocation_id\
+        \ = ir.BitwiseAnd(invocation_index, ir.Imm32(63));\n--- a/gpu/shadps4/shader_recompiler/ir/passes/shared_memory_barrier_pass.cpp\n\
+        +++ b/gpu/shadps4/shader_recompiler/ir/passes/shared_memory_barrier_pass.cpp\n@@ -9,14 +9,29 @@\n \n namespace\
+        \ Shader::Optimization {\n \n-static bool IsLoadShared(const IR::Inst& inst) {\n+static bool IsSpilledShared(const\
+        \ IR::Inst& inst, const Info& info) {\n+    const auto handle = inst.Arg(0);\n+    return handle.Type()\
+        \ == IR::Type::U32 && handle.IsImmediate() &&\n+           handle.U32() < info.buffers.size() &&\n+    \
+        \       info.buffers[handle.U32()].buffer_type == BufferType::SharedMemory;\n+}\n+\n+static bool IsLoadShared(const\
+        \ IR::Inst& inst, const Info& info) {\n+    const auto opcode = inst.GetOpcode();\n+    if (opcode >= IR::Opcode::LoadBufferU16\
+        \ && opcode <= IR::Opcode::LoadBufferU64) {\n+        return IsSpilledShared(inst, info);\n+    }\n    \
+        \ return inst.GetOpcode() == IR::Opcode::LoadSharedU16 ||\n            inst.GetOpcode() == IR::Opcode::LoadSharedU32\
+        \ ||\n            inst.GetOpcode() == IR::Opcode::LoadSharedU64;\n }\n \n-static bool IsWriteShared(const\
+        \ IR::Inst& inst) {\n+static bool IsWriteShared(const IR::Inst& inst, const Info& info) {\n     const IR::Opcode\
+        \ opcode = inst.GetOpcode();\n+    if ((opcode >= IR::Opcode::StoreBufferU16 && opcode <= IR::Opcode::StoreBufferU64)\
+        \ ||\n+        (opcode >= IR::Opcode::BufferAtomicIAdd32 && opcode <= IR::Opcode::BufferAtomicFCmpSwap32))\
+        \ {\n+        return IsSpilledShared(inst, info);\n+    }\n     if (opcode >= IR::Opcode::SharedAtomicIAdd32\
+        \ && opcode <= IR::Opcode::SharedAtomicCmpSwap64) {\n         return !inst.Flags<bool>();\n     }\n@@ -25,7\
+        \ +40,7 @@\n }\n \n // Inserts barriers when a shared memory write and read occur in the same basic block.\n\
+        -static void EmitBarrierInBlock(IR::Block* block) {\n+static void EmitBarrierInBlock(IR::Block* block, const\
+        \ Info& info) {\n     enum class BarrierAction : u32 {\n         None,\n         BarrierOnWrite,\n@@ -33,7\
+        \ +48,7 @@\n     };\n     BarrierAction action{};\n     for (IR::Inst& inst : block->Instructions()) {\n\
+        -        if (IsLoadShared(inst)) {\n+        if (IsLoadShared(inst, info)) {\n             if (action ==\
+        \ BarrierAction::BarrierOnRead) {\n                 IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};\n\
+        \                 ir.Barrier();\n@@ -41,7 +56,7 @@\n             action = BarrierAction::BarrierOnWrite;\n\
+        \             continue;\n         }\n-        if (IsWriteShared(inst)) {\n+        if (IsWriteShared(inst,\
+        \ info)) {\n             if (action == BarrierAction::BarrierOnWrite) {\n                 IR::IREmitter\
+        \ ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};\n                 ir.Barrier();\n@@ -65,8\
+        \ +80,10 @@\n \n static bool IsDivergent(const IR::U1& cond) {\n     return IR::BreadthFirstSearch(cond,\
+        \ [](IR::Inst* inst) -> std::optional<bool> {\n-               if (inst->GetOpcode() == IR::Opcode::GetAttributeU32\
+        \ &&\n-                   inst->Arg(0).Attribute() == IR::Attribute::LocalInvocationId) {\n+           \
+        \    if (inst->GetOpcode() == IR::Opcode::LaneId ||\n+                   (inst->GetOpcode() == IR::Opcode::GetAttributeU32\
+        \ &&\n+                    (inst->Arg(0).Attribute() == IR::Attribute::LocalInvocationId ||\n+         \
+        \            inst->Arg(0).Attribute() == IR::Attribute::LocalInvocationIndex))) {\n                    return\
+        \ true;\n                }\n                return std::nullopt;\n@@ -157,7 +174,7 @@\n             continue;\n\
+        \         }\n         if (node.type == Type::Block && divergence_depth == 0) {\n-            EmitBarrierInBlock(node.data.block);\n\
+        +            EmitBarrierInBlock(node.data.block, program.info);\n         }\n     }\n }\n--- a/gpu/shadps4/shader_recompiler/profile.h\n\
+        +++ b/gpu/shadps4/shader_recompiler/profile.h\n@@ -14,6 +14,9 @@\n     u32 supported_spirv{0x00010000};\n\
+        \     u32 subgroup_size{};\n     u32 sparse_page_shift{};\n+    // Bump when lowering changes must invalidate\
+        \ serialized shader modules.\n+    u32 shader_backend_revision{};\n+    bool native_compute_wave64{};\n\
+        \     bool support_int8{};\n     bool support_int16{};\n     bool support_int64{};\n--- /dev/null\n+++ b/gpu/shadps4/shader_recompiler/wave64_layout.h\n\
+        @@ -0,0 +1,40 @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n+#pragma once\n+\n+#include <bit>\n+#include\
+        \ <cstdint>\n+#include <stdexcept>\n+\n+namespace Shader {\n+\n+// Scratch is indexed by guest invocation,\
+        \ independent of physical subgroup\n+// membership or lane ordering. Partial waves reserve the full 64 guest\
+        \ slots.\n+// Ballots reuse each wave's first two words; peer reads use one word per guest.\n+struct Wave64Layout\
+        \ {\n+    explicit Wave64Layout(std::uint32_t size) : subgroup_size{size} {\n+        if (!size || size\
+        \ > 128 || !std::has_single_bit(size)) {\n+            throw std::invalid_argument(\"Invalid Vulkan subgroup\
+        \ size for wave64 lowering\");\n+        }\n+    }\n+\n+    std::uint32_t Slot(std::uint32_t invocation)\
+        \ const { return invocation; }\n+    std::uint32_t WaveFirstSlot(std::uint32_t invocation) const {\n+  \
+        \      return invocation & ~std::uint32_t{63};\n+    }\n+    std::uint32_t SourceSlot(std::uint32_t invocation,\
+        \ std::uint32_t guest_lane) const {\n+        return WaveFirstSlot(invocation) + (guest_lane & 63);\n+ \
+        \   }\n+    std::uint32_t BallotSlot(std::uint32_t invocation) const {\n+        return WaveFirstSlot(invocation)\
+        \ + (invocation % 64) / 32;\n+    }\n+    std::uint32_t BallotBit(std::uint32_t invocation) const {\n+ \
+        \       return std::uint32_t{1} << (invocation % 32);\n+    }\n+    std::uint32_t ScratchSlots(std::uint32_t\
+        \ invocations) const {\n+        return ((invocations + 63) / 64) * 64;\n+    }\n+\n+    std::uint32_t subgroup_size;\n\
+        +};\n+\n+} // namespace Shader\n--- a/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp\n+++ b/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp\n\
+        @@ -8,6 +8,10 @@\n #include <algorithm>\n #include <bit>\n #include <cstdlib>\n+#include <charconv>\n+#include\
+        \ <cstring>\n+#include <limits>\n+#include <string_view>\n #include <magic_enum/magic_enum.hpp>\n #include\
+        \ \"gow3_copy.h\"\n #include \"gow3_toggles.h\"\n@@ -16,6 +20,8 @@\n #include \"video_core/amdgpu/liverpool.h\"\
+        \n #include \"video_core/buffer_cache/buffer.h\"\n #include \"video_core/buffer_cache/buffer_cache.h\"\n\
+        +#include \"video_core/buffer_cache/dense_buffer_probe.h\"\n+#include \"video_core/buffer_cache/wave64_probe.h\"\
+        \n #include \"video_core/buffer_cache/memory_tracker.h\"\n #include \"video_core/renderer_vulkan/vk_graphics_pipeline.h\"\
+        \n #include \"video_core/renderer_vulkan/vk_instance.h\"\n@@ -60,46 +66,84 @@\n       stream_buffer{instance,\
+        \ scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},\n       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream,\
+        \ \"GDS Buffer\"},\n       memory_semaphore{instance} {\n-    while (arena_page_bits > MIN_ARENA_PAGE_BITS\
+        \ &&\n-           (u64{2} << arena_page_bits) > instance.GetMaxBufferSize()) {\n-        --arena_page_bits;\n\
+        -    }\n-    arena_page_size = u64{1} << arena_page_bits;\n-    num_arena_pages = u64{1} << (ADDRESS_SPACE_BITS\
+        \ - arena_page_bits);\n-    if (arena_page_bits != MAX_ARENA_PAGE_BITS) {\n-        LOG_INFO(Render_Vulkan,\
+        \ \"Buffer arenas of {} MiB (driver buffer limit {} MiB)\",\n-                 arena_page_size >> 20, instance.GetMaxBufferSize()\
+        \ >> 20);\n-    }\n-    const vk::BufferCreateInfo probe_ci = {\n-        .flags =\n-            vk::BufferCreateFlagBits::eSparseBinding\
+        \ | vk::BufferCreateFlagBits::eSparseResidency,\n-        .size = arena_page_size,\n-        .usage = ARENA_USAGE,\n\
+        -        .sharingMode = vk::SharingMode::eExclusive,\n-    };\n-    const vk::DeviceBufferMemoryRequirements\
+        \ req_info = {\n-        .pCreateInfo = &probe_ci,\n-    };\n-    const auto device = instance.GetDevice();\n\
+        -    const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;\n-    block_size\
+        \ = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);\n-    ASSERT_MSG(std::popcount(block_size)\
+        \ == 1, \"Sparse block size {} is not a power of 2\",\n-               block_size);\n-    block_shift =\
+        \ std::bit_width(block_size) - 1;\n-    blocks_per_arena_page = arena_page_size / block_size;\n-    blocks_per_arena_page_shift\
+        \ = arena_page_bits - block_shift;\n-    arena_memory_type_index =\n-        FindMemoryType(instance.GetMemoryProperties(),\
+        \ vk::MemoryPropertyFlagBits::eDeviceLocal,\n-                       reqs.memoryTypeBits)\n-           \
+        \ .value();\n-\n-    const u64 bda_pagetable_size =\n-        (blocks_per_arena_page * num_arena_pages)\
+        \ * sizeof(vk::DeviceAddress);\n+    if (!instance.UsesSparseBuffers()) {\n+        const u64 reported_budget\
+        \ = instance.GetTotalMemoryBudget();\n+        dense_budget_bytes = reported_budget\n+            ? std::clamp<u64>(reported_budget\
+        \ / 4, 256_MB, 1024_MB) : 1024_MB;\n+        if (const char* value = std::getenv(\"GOW3_DENSE_CACHE_MB\"\
+        )) {\n+            u64 mib{};\n+            const auto parsed = std::from_chars(value, value + std::strlen(value),\
+        \ mib);\n+            ASSERT_MSG(parsed.ec == std::errc{} && *parsed.ptr == '\\0' &&\n+                \
+        \       mib >= 256 && mib <= 4096,\n+                       \"GOW3_DENSE_CACHE_MB must be an integer from\
+        \ 256 to 4096\");\n+            dense_budget_bytes = mib * 1024 * 1024;\n+        }\n+        const u64\
+        \ limit = std::min({instance.GetMaxBufferSize(),\n+                                   u64(instance.MaxMemoryAllocationSize()),\
+        \ dense_budget_bytes,\n+                                   u64(std::numeric_limits<u32>::max()) & ~(u64{1_MB}\
+        \ - 1)});\n+        ASSERT_MSG(limit >= 1_MB, \"Driver buffer allocation limit is too small\");\n+     \
+        \   // Ordinary buffer offsets are aligned on a 1 MiB grid. Relocation therefore\n+        // preserves\
+        \ the small descriptor alignment adjustment held in push constants.\n+        ASSERT_MSG(instance.StorageMinAlignment()\
+        \ <= 1_MB &&\n+                   (1_MB % instance.StorageMinAlignment()) == 0,\n+                   \"\
+        Unsupported storage buffer alignment for the dense cache\");\n+        dense_buffers = std::make_unique<DenseBufferMap<Buffer>>(1_MB,\
+        \ limit);\n+        block_size = 64_KB;\n+        block_shift = 16;\n+        LOG_WARNING(Render_Vulkan,\n\
+        +                    \"Experimental dense buffer cache: {} MiB budget, 64 KiB shader pages; \"\n+      \
+        \              \"no sparse buffer flags or bindSparse calls\",\n+                    dense_budget_bytes\
+        \ >> 20);\n+    }\n+    if (!dense_buffers) {\n+        while (arena_page_bits > MIN_ARENA_PAGE_BITS &&\n\
+        +               (u64{2} << arena_page_bits) > instance.GetMaxBufferSize()) {\n+            --arena_page_bits;\n\
+        +        }\n+        arena_page_size = u64{1} << arena_page_bits;\n+        num_arena_pages = u64{1} <<\
+        \ (ADDRESS_SPACE_BITS - arena_page_bits);\n+        if (arena_page_bits != MAX_ARENA_PAGE_BITS) {\n+   \
+        \         LOG_INFO(Render_Vulkan, \"Buffer arenas of {} MiB (driver buffer limit {} MiB)\",\n+         \
+        \            arena_page_size >> 20, instance.GetMaxBufferSize() >> 20);\n+        }\n+        const vk::BufferCreateInfo\
+        \ probe_ci = {\n+            .flags =\n+                vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,\n\
+        +            .size = arena_page_size,\n+            .usage = ARENA_USAGE,\n+            .sharingMode = vk::SharingMode::eExclusive,\n\
+        +        };\n+        const vk::DeviceBufferMemoryRequirements req_info = {\n+            .pCreateInfo =\
+        \ &probe_ci,\n+        };\n+        const auto device = instance.GetDevice();\n+        const auto reqs\
+        \ = device.getBufferMemoryRequirements(req_info).memoryRequirements;\n+        block_size = Common::AlignUp(std::max<u64>(reqs.alignment,\
+        \ MIN_BLOCK_SIZE), reqs.alignment);\n+        ASSERT_MSG(std::popcount(block_size) == 1, \"Sparse block\
+        \ size {} is not a power of 2\",\n+                   block_size);\n+        block_shift = std::bit_width(block_size)\
+        \ - 1;\n+        blocks_per_arena_page = arena_page_size / block_size;\n+        blocks_per_arena_page_shift\
+        \ = arena_page_bits - block_shift;\n+        arena_memory_type_index =\n+            FindMemoryType(instance.GetMemoryProperties(),\
+        \ vk::MemoryPropertyFlagBits::eDeviceLocal,\n+                           reqs.memoryTypeBits)\n+       \
+        \         .value();\n+    }\n+\n+    const u64 num_shader_pages = u64{1} << (ADDRESS_SPACE_BITS - block_shift);\n\
+        +    const u64 bda_pagetable_size = num_shader_pages * sizeof(vk::DeviceAddress);\n     fault_manager =\
+        \ std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,\n-                           \
+        \                        blocks_per_arena_page * num_arena_pages);\n+                                  \
+        \                 num_shader_pages);\n     bda_pagetable_buffer = std::make_unique<Buffer>(\n         instance,\
+        \ 0, bda_pagetable_size, MemoryType::DeviceLocal, \"BDA Page Table Buffer\");\n     runtime.FillBuffer(bda_pagetable_buffer.get(),\
+        \ 0u, bda_pagetable_size, 0u);\n+    runtime.FillBuffer(fault_manager->GetFaultBuffer(), 0,\n+         \
+        \              fault_manager->GetFaultBuffer()->SizeBytes(), 0);\n+    const char* self_test = std::getenv(\"\
+        GOW3_DENSE_SELFTEST\");\n+    if (dense_buffers && (!self_test || std::string_view{self_test} != \"0\"))\
+        \ {\n+        RunDenseBufferProbe(instance, scheduler, runtime);\n+        RunWave64Probe(instance, scheduler);\n\
+        +    }\n }\n \n BufferCache::~BufferCache() = default;\n@@ -297,6 +341,9 @@\n std::pair<const Buffer*, u64>\
+        \ BufferCache::ObtainBuffer(VAddr device_addr, u32 size,\n                                             \
+        \            bool is_written, bool is_texel_buffer) {\n     texture_cache.ResolveReadbacks(device_addr,\
+        \ size, true, ReadbackSource::BufferObtain);\n+    ASSERT_MSG(size && device_addr < (u64{1} << ADDRESS_SPACE_BITS)\
+        \ &&\n+               size <= (u64{1} << ADDRESS_SPACE_BITS) - device_addr,\n+               \"Invalid GPU\
+        \ buffer range at {:#x}, size {}\", device_addr, size);\n     const bool stats = BufferStatsEnabled();\n\
+        \     if (stats) {\n         PrintBufferStats();\n@@ -392,9 +439,27 @@\n \n void BufferCache::ProcessFaultBuffer()\
+        \ {\n     fault_manager->ProcessFaultBuffer();\n+    if (dense_buffers) {\n+        // Resolve outside scheduler\
+        \ callbacks: a staging wait during another\n+        // upload must never recursively relocate that upload's\
+        \ destination.\n+        fault_manager->ResolvePendingFaults();\n+    }\n }\n \n void BufferCache::SynchronizeDmaBuffers()\
+        \ {\n+    if (dense_buffers) {\n+        dense_buffers->ForEach([&](u64 start, u64 size, const Buffer* arena)\
+        \ {\n+            dense_resident_ranges.ForEachInRange(\n+                start >> block_shift, (start +\
+        \ size) >> block_shift,\n+                [&](const Interval& range) {\n+                    const u64 first\
+        \ = std::max(start, range.start << block_shift);\n+                    const u64 end = std::min(start +\
+        \ size, range.end << block_shift);\n+                    // The allocator caps individual buffers below\
+        \ the u32 API size.\n+                    SynchronizeMemory(arena, first, end - first, false, false);\n\
+        +                });\n+        });\n+        return;\n+    }\n     for (const auto& range : resident_ranges)\
+        \ {\n         const u64 page = range.start >> (arena_page_bits - block_shift);\n         const VAddr device_addr\
+        \ = range.start << block_shift;\n@@ -403,7 +468,164 @@\n     }\n }\n \n+void BufferCache::DenseMemoryBarrier()\
+        \ {\n+    // DMA shaders address buffers through the page table, outside the ordinary\n+    // descriptor\
+        \ range tracker. Cover those accesses as well as explicit copies.\n+    runtime.FlushBarriers();\n+    scheduler.EndRendering();\n\
+        +    scheduler.Record([](vk::CommandBuffer cmdbuf) {\n+        const vk::MemoryBarrier2 barrier{\n+    \
+        \        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,\n+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead\
+        \ | vk::AccessFlagBits2::eMemoryWrite,\n+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,\n\
+        +            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,\n+ \
+        \       };\n+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{\n+            .memoryBarrierCount = 1,\
+        \ .pMemoryBarriers = &barrier});\n+    });\n+}\n+\n+const Buffer* BufferCache::GetDenseArena(u64 first_block,\
+        \ u64 last_block) {\n+    const u64 start = first_block << block_shift;\n+    const u64 size = (last_block\
+        \ - first_block + 1) << block_shift;\n+    if (const Buffer* existing = dense_buffers->Find(start, size))\
+        \ {\n+        return existing;\n+    }\n+    DenseMemoryBarrier();\n+    bool initialized{};\n+    const\
+        \ auto result = dense_buffers->Acquire(\n+        start, size,\n+        [&](u64 address, u64 bytes) {\n\
+        +            const u64 live = dense_live_bytes->load(std::memory_order_relaxed);\n+            ASSERT_MSG(bytes\
+        \ <= dense_budget_bytes && live <= dense_budget_bytes - bytes,\n+                       \"Dense buffer cache\
+        \ budget exceeded: {} MiB live, {} MiB requested, \"\n+                       \"{} MiB limit (includes buffers\
+        \ awaiting GPU completion). \"\n+                       \"GOW3_DENSE_CACHE_MB controls this cache, not texture\
+        \ or game memory.\",\n+                       live >> 20, bytes >> 20, dense_budget_bytes >> 20);\n+   \
+        \         auto buffer = std::make_unique<Buffer>(instance, address, bytes,\n+                          \
+        \                         MemoryType::DeviceLocal, \"Dense guest buffer\");\n+            dense_live_bytes->fetch_add(bytes,\
+        \ std::memory_order_relaxed);\n+            return buffer;\n+        },\n+        [&](const Buffer* old,\
+        \ const Buffer* replacement, u64 destination, u64 bytes) {\n+            if (!initialized) {\n+        \
+        \        runtime.FillBuffer(replacement, 0, replacement->SizeBytes(), 0);\n+                initialized\
+        \ = true;\n+            }\n+            const vk::BufferCopy copy{.srcOffset = 0, .dstOffset = destination,\
+        \ .size = bytes};\n+            runtime.CopyBuffer(old, replacement, std::span{&copy, 1});\n+        });\n\
+        +    if (!initialized) {\n+        // New padding is zeroed before any shader page is published.\n+    \
+        \    runtime.FillBuffer(result.buffer, 0, result.buffer->SizeBytes(), 0);\n+    }\n+    dense_handles.emplace(static_cast<VkBuffer>(result.buffer->Handle()),\
+        \ result.buffer);\n+    dense_address_updates.Add({result.buffer->CpuAddr() >> block_shift,\n+         \
+        \                     (result.buffer->CpuAddr() + result.buffer->SizeBytes()) >> block_shift});\n+    return\
+        \ result.buffer;\n+}\n+\n+void BufferCache::EnsureDenseResident(const Buffer* arena, u64 first_block, u64\
+        \ last_block) {\n+    IntervalList<> gaps;\n+    dense_resident_ranges.ForEachGap(first_block, last_block\
+        \ + 1,\n+                                    [&](u64 start, u64 end) { gaps.Add({start, end}); });\n+  \
+        \  for (const auto& gap : gaps) {\n+        // Upload the whole shader page before publishing its address.\
+        \ A later\n+        // address-based load can touch a different byte in that same page.\n+        SynchronizeMemory(arena,\
+        \ gap.start << block_shift,\n+                          (gap.end - gap.start) << block_shift, false, false);\n\
+        +        dense_resident_ranges.Add(gap);\n+        dense_address_updates.Add(gap);\n+    }\n+}\n+\n+void\
+        \ BufferCache::ResolveDenseBinding(const Buffer*& buffer, u64& offset) const {\n+    if (dense_buffers)\
+        \ {\n+        std::tie(buffer, offset) = dense_buffers->Resolve(buffer, offset);\n+    }\n+}\n+\n+void BufferCache::ResolveDenseBinding(vk::Buffer&\
+        \ buffer, u64& offset) const {\n+    if (!dense_buffers || !buffer) {\n+        return;\n+    }\n+    const\
+        \ auto found = dense_handles.find(static_cast<VkBuffer>(buffer));\n+    if (found == dense_handles.end())\
+        \ {\n+        return;\n+    }\n+    const Buffer* current = found->second;\n+    ResolveDenseBinding(current,\
+        \ offset);\n+    buffer = current->Handle();\n+}\n+\n+void BufferCache::PrepareDenseBuffers() {\n+    if\
+        \ (!dense_buffers || dense_address_updates.Empty()) {\n+        return;\n+    }\n+    std::vector<vk::DeviceAddress>\
+        \ addresses;\n+    std::vector<vk::BufferCopy> copies;\n+    // Build the complete update before recording:\
+        \ no staging-ring wait can run\n+    // callbacks or change the map while these address ranges are being\
+        \ walked.\n+    dense_buffers->ForEach([&](u64 base, u64 bytes, const Buffer* arena) {\n+        for (const\
+        \ auto& update : dense_address_updates) {\n+            const u64 first = std::max(base >> block_shift,\
+        \ update.start);\n+            const u64 last = std::min((base + bytes) >> block_shift, update.end);\n+\
+        \            dense_resident_ranges.ForEachInRange(first, last, [&](const Interval& resident) {\n+      \
+        \          const u64 start = std::max(first, resident.start);\n+                const u64 end = std::min(last,\
+        \ resident.end);\n+                copies.push_back(vk::BufferCopy{\n+                    .srcOffset = addresses.size()\
+        \ * sizeof(vk::DeviceAddress),\n+                    .dstOffset = start * sizeof(vk::DeviceAddress),\n+\
+        \                    .size = (end - start) * sizeof(vk::DeviceAddress),\n+                });\n+       \
+        \         for (u64 block = start; block < end; ++block) {\n+                    addresses.push_back(arena->BufferDeviceAddress()\
+        \ + (block << block_shift) - base);\n+                }\n+            });\n+        }\n+    });\n+    dense_address_updates.Clear();\n\
+        +    if (addresses.empty()) {\n+        return;\n+    }\n+    DenseMemoryBarrier(); // earlier shaders must\
+        \ finish reading the old address entries\n+    auto upload = std::make_unique<Buffer>(\n+        instance,\
+        \ 0, addresses.size() * sizeof(vk::DeviceAddress), MemoryType::HostUncached,\n+        \"Dense shader address\
+        \ updates\", vk::BufferUsageFlagBits::eTransferSrc);\n+    ASSERT_MSG(!upload->mapped_data.empty(), \"Dense\
+        \ address upload memory is not host-visible\");\n+    std::memcpy(upload->mapped_data.data(), addresses.data(),\
+        \ upload->SizeBytes());\n+    upload->Flush(0, upload->SizeBytes());\n+    runtime.CopyBuffer(upload.get(),\
+        \ bda_pagetable_buffer.get(), copies);\n+    // Make both preserved buffer contents and new address entries\
+        \ visible to\n+    // subsequent shader dereferences. Existing already-recorded draws precede it.\n+   \
+        \ DenseMemoryBarrier();\n+    scheduler.DeferOperation([upload = std::move(upload)]() mutable { upload.reset();\
+        \ });\n+}\n+\n+void BufferCache::RetireDenseBuffers() {\n+    if (!dense_buffers) {\n+        return;\n\
+        +    }\n+    auto retired = dense_buffers->TakeRetired();\n+    if (retired.empty()) {\n+        return;\n\
+        +    }\n+    u64 bytes{};\n+    for (const auto& old : retired) {\n+        dense_handles.erase(static_cast<VkBuffer>(old.buffer->Handle()));\n\
+        +        bytes += old.size;\n+    }\n+    scheduler.DeferOperation([retired = std::move(retired), bytes,\n\
+        +                              live = dense_live_bytes]() mutable {\n+        retired.clear();\n+      \
+        \  live->fetch_sub(bytes, std::memory_order_relaxed);\n+    });\n+}\n+\n const Buffer* BufferCache::GetArena(u64\
+        \ first_block, u64 last_block) {\n+    if (dense_buffers) {\n+        return GetDenseArena(first_block,\
+        \ last_block);\n+    }\n     const u64 first_page = first_block >> blocks_per_arena_page_shift;\n     const\
+        \ u64 last_page = last_block >> blocks_per_arena_page_shift;\n     ASSERT_MSG(last_page - first_page <=\
+        \ 1,\n@@ -458,6 +680,10 @@\n }\n \n void BufferCache::EnsureResident(const Buffer* arena, u64 first_block,\
+        \ u64 last_block) {\n+    if (dense_buffers) {\n+        EnsureDenseResident(arena, first_block, last_block);\n\
+        +        return;\n+    }\n     u32 resident_blocks{};\n     IntervalList bind_ranges;\n     resident_ranges.ForEachGap(first_block,\
+        \ last_block + 1, [&](u64 start, u64 end) {\n@@ -680,6 +906,12 @@\n }\n \n void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo&\
+        \ info) {\n+    if (dense_buffers) {\n+        // Normally prepared before each game draw. Non-draw transfers\
+        \ may leave\n+        // address updates for the next submission, so publish those as well.\n+        PrepareDenseBuffers();\n\
+        +        return;\n+    }\n     if (pending_binds.empty()) {\n         return;\n     }\n--- a/gpu/shadps4/video_core/buffer_cache/buffer_cache.h\n\
+        +++ b/gpu/shadps4/video_core/buffer_cache/buffer_cache.h\n@@ -6,11 +6,15 @@\n #include \"gow3_copy.h\"\n\
+        \ \n #include <deque>\n+#include <atomic>\n+#include <memory>\n+#include <unordered_map>\n #include <boost/container/small_vector.hpp>\n\
+        \ \n #include \"common/interval_set.h\"\n #include \"common/types.h\"\n #include \"video_core/buffer_cache/buffer.h\"\
+        \n+#include \"video_core/buffer_cache/dense_buffer_map.h\"\n #include \"video_core/buffer_cache/fault_manager.h\"\
+        \n #include \"video_core/buffer_cache/range_set.h\"\n #include \"video_core/renderer_vulkan/vk_semaphore.h\"\
+        \n@@ -112,6 +116,18 @@\n     /// Commits pending sparse buffer memory binds. Must be called before every\
+        \ scheduler submit.\n     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);\n \n+    bool UsesDenseBuffers()\
+        \ const noexcept { return dense_buffers != nullptr; }\n+\n+    /// Repair bindings saved before another\
+        \ request coalesced their allocation.\n+    void ResolveDenseBinding(const Buffer*& buffer, u64& offset)\
+        \ const;\n+    void ResolveDenseBinding(vk::Buffer& buffer, u64& offset) const;\n+\n+    /// Publish pending\
+        \ shader addresses before draws/dispatches can consume them.\n+    void PrepareDenseBuffers();\n+\n+   \
+        \ /// Call only after CPU bindings for a completed command have been refreshed.\n+    void RetireDenseBuffers();\n\
+        +\n private:\n     struct ArenaBinds {\n         const Buffer* arena;\n@@ -129,6 +145,10 @@\n     const\
+        \ Buffer* GetArena(u64 first_block, u64 last_block);\n \n     void EnsureResident(const Buffer* arena, u64\
+        \ first_block, u64 last_block);\n+\n+    const Buffer* GetDenseArena(u64 first_block, u64 last_block);\n\
+        +    void EnsureDenseResident(const Buffer* arena, u64 first_block, u64 last_block);\n+    void DenseMemoryBarrier();\n\
+        \ \n     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);\n \n@@ -175,6 +195,14 @@\n\
+        \     std::vector<ArenaBinds> pending_binds;\n     Vulkan::Semaphore memory_semaphore;\n \n+    std::unique_ptr<DenseBufferMap<Buffer>>\
+        \ dense_buffers;\n+    std::unordered_map<VkBuffer, const Buffer*> dense_handles;\n+    IntervalList<> dense_resident_ranges;\n\
+        +    IntervalList<> dense_address_updates;\n+    std::shared_ptr<std::atomic<u64>> dense_live_bytes =\n\
+        +        std::make_shared<std::atomic<u64>>(0);\n+    u64 dense_budget_bytes{};\n+\n     struct Backing\
+        \ : public Interval {\n         vk::DeviceMemory memory;\n         u64 offset;\n--- /dev/null\n+++ b/gpu/shadps4/video_core/buffer_cache/dense_buffer_map.h\n\
+        @@ -0,0 +1,179 @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n+#pragma once\n+\n+#include <algorithm>\n\
+        +#include <cstdint>\n+#include <iterator>\n+#include <map>\n+#include <memory>\n+#include <stdexcept>\n\
+        +#include <unordered_map>\n+#include <utility>\n+#include <vector>\n+\n+namespace VideoCore {\n+\n+// A\
+        \ guest-range index for ordinary, fully bound buffers. This class owns no Vulkan\n+// policy: the renderer\
+        \ supplies allocation and ordered GPU-copy callbacks. Keeping\n+// the range and lifetime logic here also\
+        \ allows it to be tested without a GPU.\n+template <typename Buffer>\n+class DenseBufferMap {\n+public:\n\
+        +    using Address = std::uint64_t;\n+    struct Entry {\n+        Address start;\n+        Address size;\n\
+        +        std::unique_ptr<Buffer> buffer;\n+        Address End() const { return start + size; }\n+    };\n\
+        +    struct Acquisition {\n+        Buffer* buffer;\n+        bool created;\n+        bool migrated;\n+\
+        \    };\n+\n+    explicit DenseBufferMap(Address granule, Address max_allocation,\n+                   \
+        \         Address address_space = Address{1} << 40)\n+        : granule{granule}, max_allocation{max_allocation},\
+        \ address_space{address_space} {\n+        if (!granule || (granule & (granule - 1)) || !max_allocation\
+        \ ||\n+            !address_space || address_space % granule) {\n+            throw std::invalid_argument(\"\
+        Invalid dense-buffer limits\");\n+        }\n+    }\n+\n+    // Callbacks must not reenter this map. Publish\
+        \ the new range only after its\n+    // allocation and all preservation copies have succeeded. Old objects\
+        \ remain\n+    // alive until the caller explicitly retires them after refreshing CPU bindings.\n+    template\
+        \ <typename Allocate, typename Copy>\n+    Acquisition Acquire(Address address, Address size, Allocate&&\
+        \ allocate, Copy&& copy) {\n+        CheckRange(address, size);\n+        if (const auto* entry = FindEntry(address);\
+        \ entry && size <= entry->End() - address) {\n+            return {entry->buffer.get(), false, false};\n\
+        +        }\n+        Address start = address & ~(granule - 1);\n+        const Address end = address + size;\n\
+        +        Address stop = end + ((granule - end % granule) % granule);\n+        auto first = entries.lower_bound(start);\n\
+        +        if (first != entries.begin() && std::prev(first)->second.End() > start) {\n+            --first;\n\
+        +        }\n+        auto last = first;\n+        while (last != entries.end() && last->second.start < stop)\
+        \ {\n+            start = std::min(start, last->second.start);\n+            stop = std::max(stop, last->second.End());\n\
+        +            ++last;\n+        }\n+        if (stop - start > max_allocation) {\n+            throw std::length_error(\"\
+        Dense-buffer request exceeds the allocation limit\");\n+        }\n+        Entry replacement{start, stop\
+        \ - start, allocate(start, stop - start)};\n+        if (!replacement.buffer) {\n+            throw std::runtime_error(\"\
+        Dense-buffer allocator returned no buffer\");\n+        }\n+        const bool migrated = first != last;\n\
+        +        // Reserve before changing the index; CPU allocation failure leaves the\n+        // previous index\
+        \ and all of its buffers valid.\n+        retired.reserve(retired.size() + std::distance(first, last));\n\
+        +        auto* result = replacement.buffer.get();\n+        const auto [inserted, ok] = pointer_ranges.emplace(result,\
+        \ Range{start, stop});\n+        if (!ok) {\n+            throw std::logic_error(\"Duplicate live dense-buffer\
+        \ identity\");\n+        }\n+        // Allocate the new tree node before removing old nodes (their key\
+        \ can be\n+        // identical). Node extraction makes replacing that key allocation-free.\n+        std::map<Address,\
+        \ Entry> staged;\n+        try {\n+            staged.emplace(start, std::move(replacement));\n+       \
+        \     // Allocate every index node before recording preservation copies.\n+            // The copy callback\
+        \ must not reenter this map; if it throws after\n+            // recording GPU work, the caller must abandon\
+        \ that recording.\n+            for (auto it = first; it != last; ++it) {\n+                const auto&\
+        \ old = it->second;\n+                copy(old.buffer.get(), result, old.start - start, old.size);\n+  \
+        \          }\n+        } catch (...) {\n+            pointer_ranges.erase(inserted);\n+            throw;\n\
+        +        }\n+        for (auto it = first; it != last;) {\n+            active_bytes -= it->second.size;\n\
+        +            retired.push_back(std::move(it->second));\n+            it = entries.erase(it);\n+        }\n\
+        +        entries.insert(staged.extract(staged.begin()));\n+        active_bytes += stop - start;\n+    \
+        \    return {result, true, migrated};\n+    }\n+\n+    const Buffer* Find(Address address, Address size\
+        \ = 1) const {\n+        if (!size || address >= address_space || size > address_space - address) {\n+ \
+        \           return nullptr;\n+        }\n+        const auto* entry = FindEntry(address);\n+        return\
+        \ entry && size <= entry->End() - address ? entry->buffer.get() : nullptr;\n+    }\n+\n+    // Resolve a\
+        \ handle saved before a merge without allocating or uploading again.\n+    // Unknown buffers (stream/staging/GDS)\
+        \ pass through unchanged.\n+    std::pair<const Buffer*, Address> Resolve(const Buffer* buffer, Address\
+        \ offset) const {\n+        const auto old = pointer_ranges.find(buffer);\n+        if (old == pointer_ranges.end())\
+        \ {\n+            return {buffer, offset};\n+        }\n+        if (offset >= old->second.end - old->second.start)\
+        \ {\n+            throw std::out_of_range(\"Dense-buffer binding offset is out of bounds\");\n+        }\n\
+        +        const Address guest = old->second.start + offset;\n+        const auto* current = FindEntry(guest);\n\
+        +        if (!current) {\n+            throw std::logic_error(\"Dense-buffer backing was lost\");\n+   \
+        \     }\n+        return {current->buffer.get(), guest - current->start};\n+    }\n+\n+    // Transfer ownership,\
+        \ not destruction. The renderer keeps these objects until\n+    // the GPU submission that last used them\
+        \ completes.\n+    std::vector<Entry> TakeRetired() {\n+        for (const auto& old : retired) {\n+   \
+        \         pointer_ranges.erase(old.buffer.get());\n+        }\n+        auto result = std::move(retired);\n\
+        +        retired.clear();\n+        return result;\n+    }\n+\n+    template <typename Visit>\n+    void\
+        \ ForEach(Visit&& visit) const {\n+        for (const auto& [address, entry] : entries) {\n+           \
+        \ visit(address, entry.size, entry.buffer.get());\n+        }\n+    }\n+    Address ActiveBytes() const\
+        \ { return active_bytes; }\n+    std::size_t Size() const { return entries.size(); }\n+\n+private:\n+  \
+        \  struct Range { Address start, end; };\n+    const Entry* FindEntry(Address address) const {\n+      \
+        \  auto it = entries.upper_bound(address);\n+        if (it == entries.begin()) {\n+            return nullptr;\n\
+        +        }\n+        --it;\n+        return address < it->second.End() ? &it->second : nullptr;\n+    }\n\
+        +    void CheckRange(Address address, Address size) const {\n+        if (!size || address >= address_space\
+        \ || size > address_space - address) {\n+            throw std::out_of_range(\"Invalid dense-buffer guest\
+        \ range\");\n+        }\n+    }\n+\n+    Address granule;\n+    Address max_allocation;\n+    Address address_space;\n\
+        +    Address active_bytes{};\n+    std::map<Address, Entry> entries;\n+    std::unordered_map<const Buffer*,\
+        \ Range> pointer_ranges;\n+    std::vector<Entry> retired;\n+};\n+\n+} // namespace VideoCore\n--- /dev/null\n\
+        +++ b/gpu/shadps4/video_core/buffer_cache/dense_buffer_probe.cpp\n@@ -0,0 +1,139 @@\n+// SPDX-License-Identifier:\
+        \ GPL-2.0-or-later\n+#include <array>\n+#include <cstdio>\n+#include <cstring>\n+#include <stdexcept>\n\
+        +#include \"video_core/buffer_cache/buffer.h\"\n+#include \"video_core/buffer_cache/dense_buffer_map.h\"\
+        \n+#include \"video_core/buffer_cache/dense_buffer_probe.h\"\n+#include \"video_core/host_shaders/dense_buffer_probe_comp.h\"\
+        \n+#include \"video_core/renderer_vulkan/vk_instance.h\"\n+#include \"video_core/renderer_vulkan/vk_platform.h\"\
+        \n+#include \"video_core/renderer_vulkan/vk_runtime.h\"\n+#include \"video_core/renderer_vulkan/vk_scheduler.h\"\
+        \n+#include \"video_core/renderer_vulkan/vk_shader_util.h\"\n+\n+namespace VideoCore {\n+\n+void RunDenseBufferProbe(const\
+        \ Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,\n+                         Vulkan::Runtime&\
+        \ runtime) {\n+    std::printf(\"GOW3_MALI_DENSE_BUFFER_PROBE=START (ordinary buffers, copies, BDA compute)\\\
+        n\");\n+    std::fflush(stdout);\n+    DenseBufferMap<Buffer> buffers{64_KB, 1_MB};\n+    bool initialized{};\n\
+        +    const auto allocate = [&](u64 address, u64 size) {\n+        initialized = false;\n+        auto buffer\
+        \ = std::make_unique<Buffer>(instance, address, size, MemoryType::DeviceLocal);\n+        return buffer;\n\
+        +    };\n+    const auto preserve = [&](const Buffer* old, const Buffer* next, u64 offset, u64 size) {\n\
+        +        if (!initialized) {\n+            runtime.FillBuffer(next, 0, next->SizeBytes(), 0);\n+       \
+        \     initialized = true;\n+        }\n+        const vk::BufferCopy copy{.srcOffset = 0, .dstOffset = offset,\
+        \ .size = size};\n+        runtime.CopyBuffer(old, next, std::span{&copy, 1});\n+    };\n+    auto* old_a\
+        \ = buffers.Acquire(0x100000, 4, allocate, preserve).buffer;\n+    runtime.FillBuffer(old_a, 0, old_a->SizeBytes(),\
+        \ 0);\n+    auto* old_b = buffers.Acquire(0x120000, 4, allocate, preserve).buffer;\n+    runtime.FillBuffer(old_b,\
+        \ 0, old_b->SizeBytes(), 0x2468ACE0u);\n+\n+    const std::array<u32, 4> seed{0x10203040u, 0x50607080u,\
+        \ 0x90A0B0C0u, 0xD0E0F000u};\n+    Buffer upload{instance, 0, sizeof(seed), MemoryType::HostUncached, \"\
+        Dense probe seed\",\n+                  vk::BufferUsageFlagBits::eTransferSrc};\n+    std::memcpy(upload.mapped_data.data(),\
+        \ seed.data(), sizeof(seed));\n+    upload.Flush(0, sizeof(seed));\n+    const vk::BufferCopy seed_copy{.srcOffset\
+        \ = 0, .dstOffset = 0, .size = sizeof(seed)};\n+    runtime.CopyBuffer(&upload, old_a, std::span{&seed_copy,\
+        \ 1});\n+\n+    // This bridge coalesces two allocations after GPU writes have been recorded.\n+    auto*\
+        \ merged = buffers.Acquire(0x10FFF8, 0x10010, allocate, preserve).buffer;\n+    const vk::BufferCopy overlap{.srcOffset\
+        \ = 0, .dstOffset = 4, .size = sizeof(seed)};\n+    runtime.CopyBuffer(merged, merged, std::span{&overlap,\
+        \ 1});\n+    const auto [current_a, a_offset] = buffers.Resolve(old_a, 4);\n+    const auto [current_b,\
+        \ b_offset] = buffers.Resolve(old_b, 12);\n+    const std::array<vk::DeviceAddress, 4> addresses{\n+   \
+        \     current_a->BufferDeviceAddress() + a_offset,\n+        merged->BufferDeviceAddress() + 16,\n+    \
+        \    current_b->BufferDeviceAddress() + b_offset,\n+        merged->BufferDeviceAddress() + 64_KB + 4,\n\
+        +    };\n+    Buffer table{instance, 0, sizeof(addresses), MemoryType::HostUncached, \"Dense probe addresses\"\
+        ,\n+                 vk::BufferUsageFlagBits::eStorageBuffer};\n+    std::memcpy(table.mapped_data.data(),\
+        \ addresses.data(), sizeof(addresses));\n+    table.Flush(0, sizeof(addresses));\n+    Buffer output{instance,\
+        \ 0, 4 * sizeof(u32), MemoryType::HostCached, \"Dense probe result\",\n+                  vk::BufferUsageFlagBits::eStorageBuffer};\n\
+        +    std::memset(output.mapped_data.data(), 0xFF, output.SizeBytes());\n+    output.Flush(0, output.SizeBytes());\n\
+        +\n+    const auto device = instance.GetDevice();\n+    const std::array<vk::DescriptorSetLayoutBinding,\
+        \ 2> bindings{{\n+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},\n\
+        +        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},\n+    }};\n+   \
+        \ const auto set_layout = Vulkan::Check(device.createDescriptorSetLayoutUnique({\n+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,\n\
+        +        .bindingCount = static_cast<u32>(bindings.size()), .pBindings = bindings.data(),\n+    }));\n+\
+        \    const auto layout = Vulkan::Check(device.createPipelineLayoutUnique({\n+        .setLayoutCount = 1,\
+        \ .pSetLayouts = &*set_layout,\n+    }));\n+    const auto module = Vulkan::CompileSPV(DENSE_BUFFER_PROBE_COMP,\
+        \ device);\n+    const auto pipeline = Vulkan::Check(device.createComputePipelineUnique(\n+        {}, vk::ComputePipelineCreateInfo{\n\
+        +                .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module,\n+            \
+        \              .pName = \"main\"},\n+                .layout = *layout,\n+            }));\n+    device.destroyShaderModule(module);\n\
+        +    runtime.FlushBarriers();\n+    scheduler.EndRendering();\n+    scheduler.Record([table_handle = table.Handle(),\
+        \ output_handle = output.Handle(),\n+                      pipeline = *pipeline, layout = *layout](vk::CommandBuffer\
+        \ cmdbuf) {\n+        const vk::MemoryBarrier2 before{\n+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,\n\
+        +            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,\n+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,\n\
+        +            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,\n+ \
+        \       };\n+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{\n+            .memoryBarrierCount = 1,\
+        \ .pMemoryBarriers = &before});\n+        const std::array<vk::DescriptorBufferInfo, 2> infos{{\n+     \
+        \       {table_handle, 0, 4 * sizeof(vk::DeviceAddress)},\n+            {output_handle, 0, 4 * sizeof(u32)},\n\
+        +        }};\n+        std::array<vk::WriteDescriptorSet, 2> writes{};\n+        for (u32 i = 0; i < writes.size();\
+        \ ++i) {\n+            writes[i] = {.dstBinding = i, .descriptorCount = 1,\n+                         .descriptorType\
+        \ = vk::DescriptorType::eStorageBuffer,\n+                         .pBufferInfo = &infos[i]};\n+       \
+        \ }\n+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);\n+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,\
+        \ layout, 0, writes);\n+        cmdbuf.dispatch(1, 1, 1);\n+        const vk::MemoryBarrier2 after{\n+ \
+        \           .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,\n+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,\n\
+        +            .dstStageMask = vk::PipelineStageFlagBits2::eHost,\n+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,\n\
+        +        };\n+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{\n+            .memoryBarrierCount = 1,\
+        \ .pMemoryBarriers = &after});\n+    });\n+    scheduler.Finish();\n+    output.Invalidate(0, output.SizeBytes());\n\
+        +    std::array<u32, 4> actual{};\n+    std::memcpy(actual.data(), output.mapped_data.data(), sizeof(actual));\n\
+        +    if (actual != std::array<u32, 4>{seed[0], seed[3], 0x2468ACE0u, 0}) {\n+        std::fprintf(stderr,\
+        \ \"Dense probe mismatch: %08x %08x %08x %08x\\n\",\n+                     actual[0], actual[1], actual[2],\
+        \ actual[3]);\n+        throw std::runtime_error(\"Dense buffer primitive test failed on the selected Vulkan\
+        \ driver\");\n+    }\n+    std::printf(\"GOW3_MALI_DENSE_BUFFER_PROBE=PASS \"\n+                \"(GPU preservation\
+        \ copies, overlap snapshot, relocated BDA reads, host readback)\\n\");\n+    std::fflush(stdout);\n+}\n\
+        +\n+} // namespace VideoCore\n--- /dev/null\n+++ b/gpu/shadps4/video_core/buffer_cache/dense_buffer_probe.h\n\
+        @@ -0,0 +1,12 @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n+#pragma once\n+namespace Vulkan {\n+class\
+        \ Instance;\n+class Scheduler;\n+class Runtime;\n+}\n+namespace VideoCore {\n+// Runs only on the selected\
+        \ real Vulkan driver. This is a primitive test, not\n+// a game compatibility test. Failure is reported\
+        \ by the initialization guard.\n+void RunDenseBufferProbe(const Vulkan::Instance&, Vulkan::Scheduler&, Vulkan::Runtime&);\n\
+        +}\n--- a/gpu/shadps4/video_core/buffer_cache/fault_manager.cpp\n+++ b/gpu/shadps4/video_core/buffer_cache/fault_manager.cpp\n\
+        @@ -1,6 +1,11 @@\n // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project\n // SPDX-License-Identifier:\
+        \ GPL-2.0-or-later\n \n+#include <algorithm>\n+#include <bit>\n+#include <limits>\n+#include <utility>\n\
+        +#include <vector>\n #include \"common/div_ceil.h\"\n #include \"video_core/buffer_cache/buffer_cache.h\"\
+        \n #include \"video_core/buffer_cache/fault_manager.h\"\n@@ -93,6 +98,7 @@\n     const u32 offset = current_area\
+        \ * PageFaultAreaSize;\n     u8* mapped = download_buffer.mapped_data.data() + offset;\n     std::memset(mapped,\
+        \ 0, PageFaultAreaSize);\n+    download_buffer.Flush(offset, PageFaultAreaSize);\n \n     const vk::BufferMemoryBarrier2\
+        \ pre_barrier = {\n         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,\n@@ -161,19 +167,23\
+        \ @@\n         .pBufferMemoryBarriers = &post_barrier,\n     });\n \n-    scheduler.DeferOperation([this,\
+        \ mapped, area = current_area] {\n-        fault_ranges.Clear();\n+    scheduler.DeferOperation([this, mapped,\
+        \ offset, area = current_area] {\n+        download_buffer.Invalidate(offset, PageFaultAreaSize);\n    \
+        \     const u64* fault_buf = std::bit_cast<const u64*>(mapped);\n-        const u32 fault_count = fault_buf[0];\n\
+        +        const u32 fault_count = std::min<u64>(fault_buf[0], MaxPageFaults - 1);\n+        if (fault_buf[0]\
+        \ >= MaxPageFaults) {\n+            LOG_WARNING(Render_Vulkan, \"GPU fault buffer overflow: {} faults; processing\
+        \ {}\",\n+                        fault_buf[0], fault_count);\n+        }\n         for (u32 i = 1; i <=\
+        \ fault_count; ++i) {\n-            fault_ranges.Add(fault_buf[i], sparse_pagesize);\n-            LOG_INFO(Render_Vulkan,\
+        \ \"Accessed non-GPU cached memory at {:#x}\", fault_buf[i]);\n+            const u64 address = fault_buf[i];\n\
+        +            if (address < (u64{1} << 40) && address % sparse_pagesize == 0) {\n+                fault_ranges.Add(address,\
+        \ sparse_pagesize);\n+            }\n         }\n-        fault_ranges.ForEach([&](VAddr start, VAddr end)\
+        \ {\n-            ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),\n-                      \
+        \ \"Buffer size is too large\");\n-            (void)buffer_cache.ObtainBuffer(start, end - start, false);\n\
+        -        });\n+        if (!buffer_cache.UsesDenseBuffers()) {\n+            ResolvePendingFaults();\n+\
+        \        }\n         fault_areas[area] = 0;\n     });\n \n@@ -181,4 +191,16 @@\n     current_area %= MaxPendingFaults;\n\
+        \ }\n \n+void FaultManager::ResolvePendingFaults() {\n+    std::vector<std::pair<VAddr, VAddr>> ranges;\n\
+        +    fault_ranges.ForEach([&](VAddr start, VAddr end) { ranges.emplace_back(start, end); });\n+    fault_ranges.Clear();\n\
+        +    // A staging wait inside ObtainBuffer can append new completed faults. Keep\n+    // them for the next\
+        \ pass instead of invalidating this pass's iteration.\n+    for (const auto& [start, end] : ranges) {\n\
+        +        ASSERT_MSG(end - start <= std::numeric_limits<u32>::max(), \"Buffer size is too large\");\n+  \
+        \      (void)buffer_cache.ObtainBuffer(start, end - start, false);\n+    }\n+}\n+\n } // namespace VideoCore\n\
+        --- a/gpu/shadps4/video_core/buffer_cache/fault_manager.h\n+++ b/gpu/shadps4/video_core/buffer_cache/fault_manager.h\n\
+        @@ -22,6 +22,8 @@\n     }\n \n     void ProcessFaultBuffer();\n+    /// Resolve completed faults outside\
+        \ staging waits in another buffer upload.\n+    void ResolvePendingFaults();\n \n private:\n     Vulkan::Scheduler&\
+        \ scheduler;\n--- /dev/null\n+++ b/gpu/shadps4/video_core/buffer_cache/snapshot_copy_plan.h\n@@ -0,0 +1,51\
+        \ @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n+#pragma once\n+\n+#include <algorithm>\n+#include\
+        \ <cstdint>\n+#include <limits>\n+#include <span>\n+#include <stdexcept>\n+#include <utility>\n+#include\
+        \ <vector>\n+\n+namespace VideoCore {\n+\n+// Read every source before writing any destination when coalesced\
+        \ buffers alias.\n+// Region is VkBufferCopy in the renderer and the same three-field type in tests.\n+template\
+        \ <typename Region>\n+struct SnapshotCopyPlan {\n+    std::vector<Region> gather;\n+    std::vector<Region>\
+        \ scatter;\n+    std::uint64_t size{};\n+    bool scatter_overlaps{};\n+};\n+\n+template <typename Region>\n\
+        +SnapshotCopyPlan<Region> MakeSnapshotCopyPlan(std::span<const Region> regions) {\n+    SnapshotCopyPlan<Region>\
+        \ plan;\n+    plan.gather.reserve(regions.size());\n+    plan.scatter.reserve(regions.size());\n+    std::vector<std::pair<std::uint64_t,\
+        \ std::uint64_t>> destinations;\n+    destinations.reserve(regions.size());\n+    for (const auto& region\
+        \ : regions) {\n+        const auto maximum = std::numeric_limits<std::uint64_t>::max();\n+        if (!region.size\
+        \ || region.size > maximum - plan.size ||\n+            region.size > maximum - region.srcOffset || region.size\
+        \ > maximum - region.dstOffset) {\n+            throw std::invalid_argument(\"Invalid overlapping buffer\
+        \ copy region\");\n+        }\n+        plan.gather.push_back(Region{region.srcOffset, plan.size, region.size});\n\
+        +        plan.scatter.push_back(Region{plan.size, region.dstOffset, region.size});\n+        destinations.emplace_back(region.dstOffset,\
+        \ region.dstOffset + region.size);\n+        plan.size += region.size;\n+    }\n+    std::sort(destinations.begin(),\
+        \ destinations.end());\n+    std::uint64_t previous_end{};\n+    for (const auto& [start, end] : destinations)\
+        \ {\n+        plan.scatter_overlaps |= start < previous_end;\n+        previous_end = std::max(previous_end,\
+        \ end);\n+    }\n+    return plan;\n+}\n+\n+} // namespace VideoCore\n--- /dev/null\n+++ b/gpu/shadps4/video_core/buffer_cache/wave64_probe.cpp\n\
+        @@ -0,0 +1,112 @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n+#include <array>\n+#include <bit>\n+#include\
+        \ <cstdio>\n+#include <cstring>\n+#include <stdexcept>\n+#include \"video_core/buffer_cache/buffer.h\"\n\
+        +#include \"video_core/buffer_cache/wave64_probe.h\"\n+#include \"video_core/host_shaders/wave64_probe_comp.h\"\
+        \n+#include \"video_core/renderer_vulkan/vk_instance.h\"\n+#include \"video_core/renderer_vulkan/vk_platform.h\"\
+        \n+#include \"video_core/renderer_vulkan/vk_scheduler.h\"\n+#include \"video_core/renderer_vulkan/vk_shader_util.h\"\
+        \n+\n+namespace VideoCore {\n+void RunWave64Probe(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler)\
+        \ {\n+    constexpr u32 threads = 128;\n+    constexpr u32 words_per_thread = 8;\n+    const u32 expected_size\
+        \ = instance.IsSubgroupSize64Supported() ? 64 : instance.SubgroupSize();\n+    std::printf(\"GOW3_MALI_WAVE64_PROBE=START\
+        \ (hardware subgroup %u, compute subgroup %u)\\n\",\n+                instance.SubgroupSize(), expected_size);\n\
+        +    std::fflush(stdout);\n+    Buffer output{instance, 0, threads * words_per_thread * sizeof(u32), MemoryType::HostCached,\n\
+        +                  \"Wave64 primitive probe\", vk::BufferUsageFlagBits::eStorageBuffer};\n+    std::memset(output.mapped_data.data(),\
+        \ 0xFF, output.SizeBytes());\n+    output.Flush(0, output.SizeBytes());\n+    Buffer scratch{instance, 0,\
+        \ threads * sizeof(u32), MemoryType::DeviceLocal,\n+                   \"Wave64 spilled LDS probe\", vk::BufferUsageFlagBits::eStorageBuffer};\n\
+        +    const auto device = instance.GetDevice();\n+    const std::array<vk::DescriptorSetLayoutBinding, 2>\
+        \ bindings{{\n+        {.binding = 0, .descriptorType = vk::DescriptorType::eStorageBuffer,\n+         .descriptorCount\
+        \ = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},\n+        {.binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer,\n\
+        +         .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},\n+    }};\n+    const\
+        \ auto set_layout = Vulkan::Check(device.createDescriptorSetLayoutUnique({\n+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,\n\
+        +        .bindingCount = static_cast<u32>(bindings.size()), .pBindings = bindings.data(),\n+    }));\n+\
+        \    const auto layout = Vulkan::Check(device.createPipelineLayoutUnique({\n+        .setLayoutCount = 1,\
+        \ .pSetLayouts = &*set_layout,\n+    }));\n+    const auto module = Vulkan::CompileSPV(WAVE64_PROBE_COMP,\
+        \ device);\n+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup{\n+        .requiredSubgroupSize\
+        \ = 64,\n+    };\n+    const auto pipeline = Vulkan::Check(device.createComputePipelineUnique(\n+      \
+        \  {}, vk::ComputePipelineCreateInfo{\n+                .stage = {.pNext = instance.IsSubgroupSize64Supported()\
+        \ ? &subgroup : nullptr,\n+                          .stage = vk::ShaderStageFlagBits::eCompute, .module\
+        \ = module,\n+                          .pName = \"main\"},\n+                .layout = *layout,\n+    \
+        \        }));\n+    device.destroyShaderModule(module);\n+    scheduler.EndRendering();\n+    scheduler.Record([buffer\
+        \ = output.Handle(), scratch = scratch.Handle(), pipeline = *pipeline,\n+                      layout =\
+        \ *layout](vk::CommandBuffer cmdbuf) {\n+        const std::array<vk::DescriptorBufferInfo, 2> infos{{\n\
+        +            {buffer, 0, threads * words_per_thread * sizeof(u32)},\n+            {scratch, 0, threads *\
+        \ sizeof(u32)},\n+        }};\n+        std::array<vk::WriteDescriptorSet, 2> writes{};\n+        for (u32\
+        \ i = 0; i < writes.size(); ++i) {\n+            writes[i] = {.dstBinding = i, .descriptorCount = 1,\n+\
+        \                         .descriptorType = vk::DescriptorType::eStorageBuffer,\n+                     \
+        \    .pBufferInfo = &infos[i]};\n+        }\n+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute,\
+        \ pipeline);\n+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);\n\
+        +        cmdbuf.dispatch(1, 1, 1);\n+        const vk::MemoryBarrier2 to_host{\n+            .srcStageMask\
+        \ = vk::PipelineStageFlagBits2::eComputeShader,\n+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,\n\
+        +            .dstStageMask = vk::PipelineStageFlagBits2::eHost,\n+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,\n\
+        +        };\n+        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});\n\
+        +    });\n+    scheduler.Finish();\n+    output.Invalidate(0, output.SizeBytes());\n+    std::array<u32,\
+        \ threads * words_per_thread> result{};\n+    std::memcpy(result.data(), output.mapped_data.data(), output.SizeBytes());\n\
+        +    const u32 observed_size = result[3];\n+    if (!std::has_single_bit(observed_size) || observed_size\
+        \ > 128 ||\n+        (instance.IsSubgroupSize64Supported() && observed_size != 64)) {\n+        throw std::runtime_error(\"\
+        Unexpected native subgroup size returned by the wave64 probe\");\n+    }\n+    for (u32 invocation = 0;\
+        \ invocation < threads; ++invocation) {\n+        const u32 first = invocation / 64 * 64;\n+        u64\
+        \ mask{};\n+        for (u32 lane = 0; lane < 64; ++lane) {\n+            const u32 index = first + lane;\n\
+        +            if (index % 7 == 0 || index % 11 == 0) mask |= u64{1} << lane;\n+        }\n+        const\
+        \ u32 lane = invocation < 64 ? 63 : 31;\n+        const std::array<u32, 8> expected{u32(mask), u32(mask\
+        \ >> 32),\n+            0x61500000u + first + lane, observed_size, u32(mask), u32(mask >> 32),\n+      \
+        \      0x61500000u + first + lane, observed_size};\n+        for (u32 word = 0; word < words_per_thread;\
+        \ ++word) {\n+            if (result[invocation * words_per_thread + word] != expected[word]) {\n+     \
+        \           std::fprintf(stderr, \"Wave64 probe mismatch: invocation=%u word=%u \"\n+                  \
+        \           \"actual=%08x expected=%08x\\n\", invocation, word,\n+                             result[invocation\
+        \ * words_per_thread + word], expected[word]);\n+                throw std::runtime_error(\"Wave64 subgroup\
+        \ primitive test failed on selected driver\");\n+            }\n+        }\n+    }\n+    std::printf(\"\
+        GOW3_MALI_WAVE64_PROBE=PASS (128 invocations, 8x16 workgroup, subgroup %u, \"\n+                \"two wave64\
+        \ ballots, peer reads, native/spilled LDS barriers)\\n\", observed_size);\n+    std::fflush(stdout);\n+}\n\
+        +} // namespace VideoCore\n--- /dev/null\n+++ b/gpu/shadps4/video_core/buffer_cache/wave64_probe.h\n@@ -0,0\
+        \ +1,9 @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n+#pragma once\n+namespace Vulkan {\n+class Instance;\n\
+        +class Scheduler;\n+}\n+namespace VideoCore {\n+void RunWave64Probe(const Vulkan::Instance&, Vulkan::Scheduler&);\n\
+        +}\n--- /dev/null\n+++ b/gpu/shadps4/video_core/host_shaders/dense_buffer_probe.comp\n@@ -0,0 +1,20 @@\n\
+        +// SPDX-License-Identifier: GPL-2.0-or-later\n+#version 460\n+#extension GL_EXT_buffer_reference : require\n\
+        +#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n+\n+layout(local_size_x = 1) in;\n\
+        +layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RawBuffer {\n+    uint words[];\n\
+        +};\n+layout(set = 0, binding = 0, std430) readonly buffer AddressTable {\n+    uint64_t addresses[];\n\
+        +};\n+layout(set = 0, binding = 1, std430) writeonly buffer Result {\n+    uint words[];\n+};\n+void main()\
+        \ {\n+    for (uint i = 0; i < 4; ++i) {\n+        words[i] = RawBuffer(addresses[i]).words[0];\n+    }\n\
+        +}\n--- /dev/null\n+++ b/gpu/shadps4/video_core/host_shaders/wave64_probe.comp\n@@ -0,0 +1,55 @@\n+// SPDX-License-Identifier:\
+        \ GPL-2.0-or-later\n+#version 460\n+#extension GL_KHR_shader_subgroup_basic : require\n+\n+// A 2D workgroup\
+        \ tests guest linear indices independently of physical lane IDs.\n+layout(local_size_x = 8, local_size_y\
+        \ = 16) in;\n+layout(set = 0, binding = 0, std430) writeonly buffer Output {\n+    uvec4 results[];\n+};\n\
+        +layout(set = 0, binding = 1, std430) coherent buffer SpilledScratch {\n+    uint spilled[];\n+};\n+shared\
+        \ uint scratch[128];\n+\n+void main() {\n+    uint index = gl_LocalInvocationIndex;\n+    uint first = index\
+        \ & ~63u;\n+    uint lane = index & 63u;\n+    uint source_lane = index < 64 ? 63 : 31;\n+    bool predicate\
+        \ = (index % 7 == 0) || (index % 11 == 0);\n+    atomicAnd(scratch[first], 0);\n+    atomicAnd(scratch[first\
+        \ + 1], 0);\n+    barrier();\n+    atomicOr(scratch[first + lane / 32], predicate ? (1u << (lane & 31u))\
+        \ : 0u);\n+    barrier();\n+    uint low = scratch[first];\n+    uint high = scratch[first + 1];\n+    barrier();\n\
+        +    scratch[index] = 0x61500000u + index;\n+    barrier();\n+    uint other = scratch[first + source_lane];\n\
+        +    barrier();\n+    results[index * 2] = uvec4(low, high, other, gl_SubgroupSize);\n+\n+    // Mirror\
+        \ guest LDS that was moved into a storage buffer. These barriers\n+    // must cover UniformMemory as well\
+        \ as workgroup execution order.\n+    atomicAnd(spilled[first], 0);\n+    atomicAnd(spilled[first + 1],\
+        \ 0);\n+    groupMemoryBarrier();\n+    barrier();\n+    atomicOr(spilled[first + lane / 32], predicate\
+        \ ? (1u << (lane & 31u)) : 0u);\n+    groupMemoryBarrier();\n+    barrier();\n+    low = spilled[first];\n\
+        +    high = spilled[first + 1];\n+    groupMemoryBarrier();\n+    barrier();\n+    spilled[index] = 0x61500000u\
+        \ + index;\n+    groupMemoryBarrier();\n+    barrier();\n+    other = spilled[first + source_lane];\n+ \
+        \   groupMemoryBarrier();\n+    barrier();\n+    results[index * 2 + 1] = uvec4(low, high, other, gl_SubgroupSize);\n\
+        +}\n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp\n+++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp\n\
+        @@ -4,6 +4,8 @@\n #include <boost/container/static_vector.hpp>\n #include <fmt/format.h>\n #include <fmt/ranges.h>\n\
+        +#include <stdexcept>\n+#include <cstdlib>\n \n #include \"common/assert.h\"\n #include \"common/debug.h\"\
+        \n@@ -179,7 +181,11 @@\n                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),\n\
+        \                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));\n \n\
+        -    CreateDevice();\n+    // A failed CreateDevice leaves device null. Do not construct the scheduler or\n\
+        +    // its semaphores with that handle; the C entry point reports this exception.\n+    if (!CreateDevice())\
+        \ {\n+        throw std::runtime_error(\"Vulkan device initialization failed; see GPU errors above\");\n\
+        +    }\n     CollectPhysicalMemoryInfo();\n     CollectImageFormatInfo();\n     CollectToolingInfo();\n\
+        @@ -420,7 +426,8 @@\n     bool graphics_queue_found = false;\n     for (std::size_t i = 0; i < family_properties.size();\
+        \ i++) {\n         const u32 index = static_cast<u32>(i);\n-        if (family_properties[i].queueFlags\
+        \ & vk::QueueFlagBits::eGraphics) {\n+        if (family_properties[i].queueCount &&\n+            (family_properties[i].queueFlags\
+        \ & vk::QueueFlagBits::eGraphics)) {\n             queue_family_index = index;\n             graphics_queue_found\
+        \ = true;\n         }\n@@ -431,23 +438,45 @@\n         return false;\n     }\n \n+    use_sparse_buffers\
+        \ = features.sparseBinding && features.sparseResidencyBuffer;\n     u32 sparse_queue_family_index = queue_family_index;\n\
+        -    if (!(family_properties[queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding)) {\n+ \
+        \   if (use_sparse_buffers &&\n+        !(family_properties[queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding))\
+        \ {\n         const auto sparse_family = std::find_if(\n             family_properties.begin(), family_properties.end(),\
+        \ [](const auto& family) {\n                 return family.queueCount && (family.queueFlags & vk::QueueFlagBits::eSparseBinding);\n\
+        \             });\n         if (sparse_family == family_properties.end()) {\n+            use_sparse_buffers\
+        \ = false;\n+        } else {\n+            sparse_queue_family_index =\n+                static_cast<u32>(sparse_family\
+        \ - family_properties.begin());\n+        }\n+    }\n+    if (const char* cache = std::getenv(\"GOW3_BUFFER_CACHE\"\
+        )) {\n+        if (std::string_view{cache} == \"dense\") {\n+            use_sparse_buffers = false;\n+\
+        \        } else if (std::string_view{cache} == \"sparse\" && !use_sparse_buffers) {\n+            LOG_CRITICAL(Render_Vulkan,\
+        \ \"Sparse buffer cache requested but unsupported\");\n+            return false;\n+        }\n+    }\n\
+        +    if (!use_sparse_buffers) {\n+        sparse_queue_family_index = queue_family_index;\n+        // The\
+        \ shader page table contains 64-bit physical buffer addresses in both\n+        // backends. Do not start\
+        \ a backend whose required address operations fail.\n+        if (!features.shaderInt64 ||\n+          \
+        \  !feature_chain.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress) {\n             LOG_CRITICAL(Render_Vulkan,\n\
+        -                         \"Unable to find a queue family with VK_QUEUE_SPARSE_BINDING_BIT; \"\n-      \
+        \                   \"sparse buffer bindings are unavailable on this device.\");\n+                    \
+        \     \"Dense buffer cache requires shaderInt64 and bufferDeviceAddress\");\n             return false;\n\
+        \         }\n-        sparse_queue_family_index = static_cast<u32>(sparse_family - family_properties.begin());\n\
+        -    }\n-    LOG_INFO(Render_Vulkan, \"Queue families: graphics={}, sparse={}, reused_graphics={}\",\n-\
+        \             queue_family_index, sparse_queue_family_index,\n-             queue_family_index == sparse_queue_family_index);\n\
+        +    }\n+    LOG_WARNING(Render_Vulkan, \"Buffer cache backend: {} (sparseBinding={}, \"\n+            \
+        \    \"sparseResidencyBuffer={}); graphics queue family={}\",\n+                use_sparse_buffers ? \"\
+        sparse\" : \"dense experimental\",\n+                static_cast<bool>(features.sparseBinding),\n+     \
+        \           static_cast<bool>(features.sparseResidencyBuffer), queue_family_index);\n \n     static constexpr\
+        \ std::array queue_priorities = {1.0f};\n     const vk::DeviceQueueCreateInfo queue_info = {\n@@ -510,8\
+        \ +539,8 @@\n                 .shaderFloat64 = features.shaderFloat64,\n                 .shaderInt64 =\
+        \ features.shaderInt64,\n                 .shaderInt16 = features.shaderInt16,\n-                .sparseBinding\
+        \ = features.sparseBinding,\n-                .sparseResidencyBuffer = features.sparseResidencyBuffer,\n\
+        +                .sparseBinding = use_sparse_buffers,\n+                .sparseResidencyBuffer = use_sparse_buffers,\n\
+        \             },\n         },\n         vk::PhysicalDeviceVulkan11Features{\n@@ -732,7 +761,8 @@\n     }\n\
+        \ \n     graphics_queue = device->getQueue(queue_family_index, 0);\n-    sparse_queue = device->getQueue(sparse_queue_family_index,\
+        \ 0);\n+    sparse_queue = use_sparse_buffers ? device->getQueue(sparse_queue_family_index, 0)\n+      \
+        \                                : vk::Queue{};\n     present_queue = device->getQueue(queue_family_index,\
+        \ 0);\n \n     if (calibrated_timestamps) {\n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h\n\
+        +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h\n@@ -101,6 +101,11 @@\n         return sparse_queue;\n\
+        \     }\n \n+    /// True only when both sparse buffer features and a binding queue are usable.\n+    bool\
+        \ UsesSparseBuffers() const {\n+        return use_sparse_buffers;\n+    }\n+\n     vk::Queue GetPresentQueue()\
+        \ const {\n         return present_queue;\n     }\n@@ -270,7 +275,9 @@\n \n     /// Returns true if the\
+        \ subgroup size can be set to match guest subgroup size\n     bool IsSubgroupSize64Supported() const {\n\
+        -        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;\n+        return\
+        \ vk13_features.subgroupSizeControl && vk13_props.minSubgroupSize <= 64 &&\n+               vk13_props.maxSubgroupSize\
+        \ >= 64 &&\n+               bool(vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);\n\
+        \     }\n \n     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.\n@@ -517,7\
+        \ +524,7 @@\n private:\n     Instance(const Frontend::WindowSystemInfo&, s32, bool, bool);\n     /// Creates\
+        \ the logical device opportunistically enabling extensions\n-    bool CreateDevice();\n+    [[nodiscard]]\
+        \ bool CreateDevice();\n \n     /// Creates the VMA allocator handle\n     void CreateAllocator();\n@@ -564,6\
+        \ +571,7 @@\n     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;\n     TracyVkCtx\
+        \ profiler_context{};\n     u32 queue_family_index{0};\n+    bool use_sparse_buffers{};\n     bool custom_border_color{};\n\
+        \     bool fragment_shader_barycentric{};\n     bool amd_shader_explicit_vertex_parameter{};\n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp\n\
+        +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp\n@@ -333,6 +333,8 @@\n         .supported_spirv\
+        \ = SpirvVersion1_6,\n         .subgroup_size = instance.SubgroupSize(),\n         .sparse_page_shift =\
+        \ sparse_page_shift,\n+        .shader_backend_revision = 2,\n+        .native_compute_wave64 = instance.IsSubgroupSize64Supported(),\n\
+        \         .support_int8 = instance.IsShaderInt8Supported(),\n         .support_int16 = instance.IsShaderInt16Supported(),\n\
+        \         .support_int64 = instance.IsShaderInt64Supported(),\n@@ -381,13 +383,19 @@\n             return\
+        \ !instance.IsFragmentShaderBarycentricSupported() &&\n                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;\n\
+        \         }(),\n-        .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary\
+        \ ||\n+        .needs_lds_barriers = !instance.IsSubgroupSize64Supported() ||\n+                       \
+        \       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||\n                               instance.GetDriverID()\
+        \ == vk::DriverId::eMesaKosmickrisp,\n         .needs_buffer_offsets = instance.StorageMinAlignment() >\
+        \ 4,\n         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,\n        \
+        \ .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,\n       \
+        \  .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),\n     };\n+    std::printf(\"\
+        GOW3_MALI_SHADER_PROFILE: hardware_subgroup=%u native_wave64=%u \"\n+                \"lds_barriers=%u barycentrics=%u\
+        \ revision=%u\\n\",\n+                instance.SubgroupSize(), unsigned(profile.native_compute_wave64),\
+        \ unsigned(profile.needs_lds_barriers),\n+                unsigned(profile.supports_fragment_shader_barycentric),\
+        \ profile.shader_backend_revision);\n+    std::fflush(stdout);\n \n     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});\n\
+        \     ASSERT_MSG(cache_result == vk::Result::eSuccess, \"Failed to create pipeline cache: {}\",\n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp\n\
+        +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp\n@@ -14,6 +14,7 @@\n #include \"video_core/renderer_vulkan/vk_platform.h\"\
+        \n #include \"gow3_overlay.h\"\n #include \"gow3_settings.h\"\n+#include \"gow3_toggles.h\"\n #include \"\
+        gow3_graphics.h\"\n #include \"video_core/renderer_vulkan/vk_temporal_upscaler.h\"\n #include \"video_core/renderer_vulkan/vk_presenter.h\"\
+        \n@@ -384,6 +385,11 @@\n \n Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&\
+        \ attribute,\n                                VAddr cpu_address) {\n+    static std::atomic<u64> diagnostic_counter{};\n\
+        +    const u64 diagnostic_sequence = Gow3Stats::mali_diagnostics\n+        ? diagnostic_counter.fetch_add(1,\
+        \ std::memory_order_relaxed) + 1 : 0;\n+    const bool diagnostic_sample = diagnostic_sequence &&\n+   \
+        \     (diagnostic_sequence <= 8 || diagnostic_sequence % 120 == 0);\n     // gow3: GOW3_FRAME_DUMP_TRIGGER=<file>:\
+        \ when the file exists it is removed and this frame's\n     // guest display buffer and presented image\
+        \ are written to GOW3_DUMP_DIR (default out/dump)\n     // as raw 32-bit pixels (menus and movies included;\
+        \ the upscaler dumps scene frames only).\n@@ -393,6 +399,15 @@\n     // gow3: scaled upscaler presets: the\
+        \ output-size display buffer drawn by the port.\n     TemporalUpscaler::Display display{};\n     const bool\
+        \ upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);\n+    if (diagnostic_sample)\
+        \ {\n+        std::printf(\"GOW3_MALI_FRAME_PREPARE: seq=%llu upscaled=%u draw_attempts=%llu \"\n+     \
+        \               \"draw_commands=%llu dispatch_commands=%llu\\n\",\n+                    static_cast<unsigned\
+        \ long long>(diagnostic_sequence), unsigned(upscaled),\n+                    static_cast<unsigned long long>(Gow3Stats::draws.load(std::memory_order_relaxed)),\n\
+        +                    static_cast<unsigned long long>(Gow3Stats::recorded_draws.load(std::memory_order_relaxed)),\n\
+        +                    static_cast<unsigned long long>(Gow3Stats::recorded_dispatches.load(std::memory_order_relaxed)));\n\
+        +        std::fflush(stdout);\n+    }\n     VideoCore::ImageId image_id{};\n     if (!upscaled) {\n    \
+        \     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};\n@@ -401,6 +416,7 @@\n   \
+        \  }\n \n     Frame* frame = GetRenderFrame();\n+    frame->diagnostic_sequence = diagnostic_sequence;\n\
+        \ \n     const auto frame_subresources = vk::ImageSubresourceRange{\n         .aspectMask = vk::ImageAspectFlagBits::eColor,\n\
+        @@ -515,6 +531,12 @@\n     frame->ready_tick = draw_scheduler.CurrentTick();\n     SubmitInfo info{};\n\
+        \     draw_scheduler.Flush(info);\n+    if (diagnostic_sample) {\n+        std::printf(\"GOW3_MALI_FRAME_READY:\
+        \ seq=%llu tick=%llu\\n\",\n+                    static_cast<unsigned long long>(diagnostic_sequence),\n\
+        +                    static_cast<unsigned long long>(frame->ready_tick));\n+        std::fflush(stdout);\n\
+        +    }\n \n     // gow3: the GPU command thread runs at most GOW3_FRAMES_AHEAD (default 1) guest frames\n\
+        \     // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the\n@@ -962,6\
+        \ +984,13 @@\n         }\n     }\n \n+    const u64 diagnostic_sequence = frame->diagnostic_sequence;\n\
+        +    if (Gow3Stats::mali_diagnostics && is_game_frame && !is_reusing_frame &&\n+        (diagnostic_sequence\
+        \ <= 8 || diagnostic_sequence % 120 == 0)) {\n+        std::printf(\"GOW3_MALI_FRAME_SENT: seq=%llu\\n\"\
+        ,\n+                    static_cast<unsigned long long>(diagnostic_sequence));\n+        std::fflush(stdout);\n\
+        +    }\n     free_frame();\n     if (!is_reusing_frame && is_game_frame) {\n         DebugState.IncFlipFrameNum();\n\
+        --- a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h\n+++ b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h\n\
+        @@ -35,6 +35,7 @@\n     vk::Fence present_done;\n     vk::Semaphore ready_semaphore;\n     u64 ready_tick;\n\
+        +    u64 diagnostic_sequence{};\n     bool is_hdr{false};\n     u8 id{};\n \n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp\n\
+        +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp\n@@ -1006,6 +1006,7 @@\n             ResolveIndexBuffer(index_offset);\n\
+        \         }\n     }\n+    RefreshDenseBufferBindings();\n     EmitVertexBuffers();\n     if (is_indexed)\
+        \ {\n         EmitIndexBuffer();\n@@ -1157,6 +1158,9 @@\n             FrameCapture::Note(note);\n      \
+        \   }\n     }\n+    if (Gow3Stats::mali_diagnostics) {\n+        Gow3Stats::recorded_draws.fetch_add(1,\
+        \ std::memory_order_relaxed);\n+    }\n     DebugState.IncDrawCall();\n \n     ResetBindings(false);\n@@\
+        \ -1221,20 +1225,31 @@\n     }\n     const auto state = BeginRendering(pipeline);\n \n-    BindVertexBuffers(pipeline);\n\
+        +    ResolveVertexBuffers(pipeline, nullptr);\n     if (is_indexed) {\n-        BindIndexBuffer();\n-  \
+        \  }\n-\n-    const auto [buffer, base] =\n+        ResolveIndexBuffer(0);\n+    }\n+\n+    auto [buffer,\
+        \ base] =\n         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);\n     needs_barrier\
+        \ |= runtime.IsBufferAccessed(buffer, base, stride * max_count);\n \n-    const VideoCore::Buffer* count_buffer;\n\
+        -    u64 count_offset;\n+    const VideoCore::Buffer* count_buffer{};\n+    u64 count_offset{};\n     if\
+        \ (count_address != 0) {\n         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address,\
+        \ 4, false);\n         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);\n+    }\n\
+        +    buffer_cache.ResolveDenseBinding(buffer, base);\n+    needs_barrier |= runtime.IsBufferAccessed(buffer,\
+        \ base, stride * max_count);\n+    if (count_address != 0) {\n+        buffer_cache.ResolveDenseBinding(count_buffer,\
+        \ count_offset);\n+        needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);\n+\
+        \    }\n+    RefreshDenseBufferBindings();\n+    EmitVertexBuffers();\n+    if (is_indexed) {\n+       \
+        \ EmitIndexBuffer();\n     }\n \n     if (needs_barrier) {\n@@ -1287,6 +1302,9 @@\n         }\n        \
+        \ predication.EndDraw(cmdbuf, zpass_query, pred.predicated, predicate_state);\n     });\n+    if (Gow3Stats::mali_diagnostics)\
+        \ {\n+        Gow3Stats::recorded_draws.fetch_add(1, std::memory_order_relaxed);\n+    }\n     DebugState.IncDrawCall();\n\
+        \ \n     ResetBindings(false);\n@@ -1342,6 +1360,7 @@\n         return;\n     }\n \n+    RefreshDenseBufferBindings();\n\
+        \     if (needs_barrier) {\n         runtime.FlushBarriers();\n     }\n@@ -1362,6 +1381,9 @@\n         cmdbuf.dispatch(dim_x,\
+        \ dim_y, dim_z);\n         predication.EndDraw(cmdbuf, std::nullopt, pred.predicated, predicate_state);\n\
+        \     });\n+    if (Gow3Stats::mali_diagnostics) {\n+        Gow3Stats::recorded_dispatches.fetch_add(1,\
+        \ std::memory_order_relaxed);\n+    }\n     DebugState.IncDispatch();\n \n     ResetBindings(true);\n@@\
+        \ -1399,6 +1421,7 @@\n \n     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size,\
+        \ false);\n     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);\n+    RefreshDenseBufferBindings();\n\
+        \ \n     if (needs_barrier) {\n         runtime.FlushBarriers();\n@@ -1417,6 +1440,9 @@\n         cmdbuf.dispatchIndirect(args,\
+        \ args_offset);\n         predication.EndDraw(cmdbuf, std::nullopt, pred.predicated, predicate_state);\n\
+        \     });\n+    if (Gow3Stats::mali_diagnostics) {\n+        Gow3Stats::recorded_dispatches.fetch_add(1,\
+        \ std::memory_order_relaxed);\n+    }\n     DebugState.IncDispatch();\n \n     ResetBindings(true);\n@@\
+        \ -1425,6 +1451,7 @@\n \n u64 Rasterizer::Flush() {\n     DrainDrawPipe();\n+    buffer_cache.RetireDenseBuffers();\n\
+        \     const u64 current_tick = scheduler.CurrentTick();\n     SubmitInfo info{};\n     scheduler.Flush(info);\n\
+        @@ -1475,7 +1502,8 @@\n }\n \n bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {\n-    if\
+        \ (pipeline->IsCompute() || !bind_helper.Available() || FrameCapture::Active() ||\n+    if (buffer_cache.UsesDenseBuffers()\
+        \ || pipeline->IsCompute() ||\n+        !bind_helper.Available() || FrameCapture::Active() ||\n        \
+        \ Gow3Toggle::Disabled(Gow3Toggle::TextureBindHelper) ||\n         Gow3Toggle::Disabled(Gow3Toggle::TextureBindingMemo)\
+        \ ||\n         Gow3Toggle::Disabled(Gow3Toggle::UpdateImageFastPath)) {\n@@ -1701,6 +1729,9 @@\n     //\
+        \ gow3: only the used entries go into the recording chunk (the static vectors hold 32 of\n     // each:\
+        \ ~3 KiB copied per draw).\n     auto& v = vertex_binds;\n+    for (u32 i = 0; i < v.num_buffers; ++i) {\n\
+        +        buffer_cache.ResolveDenseBinding(v.host_buffers[i], v.host_offsets[i]);\n+    }\n     const bool\
+        \ dynamic_input = instance.IsVertexInputDynamicState();\n     const u32 num_buffers = v.num_buffers;\n \
+        \    scheduler.ReserveRecordData(\n@@ -1872,6 +1903,7 @@\n }\n \n void Rasterizer::EmitIndexBuffer() {\n\
+        +    buffer_cache.ResolveDenseBinding(index_bind.handle, index_bind.offset);\n     scheduler.Record([handle\
+        \ = index_bind.handle, offset = index_bind.offset,\n                       type = index_bind.type](vk::CommandBuffer\
+        \ cmdbuf) {\n         cmdbuf.bindIndexBuffer(handle, offset, type);\n@@ -1894,6 +1926,24 @@\n         buffer_cache.ObtainBuffer(index_address,\
+        \ index_buffer_size, false);\n     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);\n\
+        \     index_bind = {buffer->Handle(), offset, index_type};\n+}\n+\n+void Rasterizer::RefreshDenseBufferBindings()\
+        \ {\n+    if (!buffer_cache.UsesDenseBuffers()) {\n+        return;\n+    }\n+    // Texture uploads, vertex/index\
+        \ resolution, or later descriptors may merge a\n+    // range resolved earlier in this draw. Repair every\
+        \ saved descriptor and the\n+    // access tracker before any game shader consumes the new address table.\n\
+        +    for (auto& info : buffer_infos) {\n+        buffer_cache.ResolveDenseBinding(info.buffer, info.offset);\n\
+        +    }\n+    for (auto& bound : bound_buffers) {\n+        buffer_cache.ResolveDenseBinding(bound.buffer,\
+        \ bound.offset);\n+        needs_barrier |= runtime.IsBufferAccessed(bound.buffer, bound.offset,\n+    \
+        \                                              bound.size, bound.is_written);\n+    }\n+    buffer_cache.PrepareDenseBuffers();\n\
+        \ }\n \n void Rasterizer::ResetBindings(bool is_compute) {\n@@ -1911,6 +1961,7 @@\n     bound_images.clear();\n\
+        \     bound_buffers.clear();\n     needs_barrier = false;\n+    buffer_cache.RetireDenseBuffers();\n }\n\
+        \ \n bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {\n@@ -3104,18 +3155,20 @@\n     }\n\
+        \     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);\n     const auto* gds_buffer = buffer_cache.GetGdsBuffer();\n\
+        -    const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {\n+    auto\
+        \ [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {\n         if (src_gds) {\n\
+        \             return {gds_buffer, src};\n         }\n         return buffer_cache.ObtainBuffer(src, num_bytes,\
+        \ false, true);\n     }();\n-    const auto [dst_buffer, dst_offset] = [&] -> std::pair<const VideoCore::Buffer*,\
+        \ u64> {\n+    auto [dst_buffer, dst_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {\n     \
+        \    if (dst_gds) {\n             return {gds_buffer, dst};\n         }\n         return buffer_cache.ObtainBuffer(dst,\
+        \ num_bytes, true, true);\n     }();\n+    buffer_cache.ResolveDenseBinding(src_buffer, src_offset);\n+\
+        \    buffer_cache.ResolveDenseBinding(dst_buffer, dst_offset);\n     const vk::BufferCopy copy = {\n   \
+        \      .srcOffset = src_offset,\n         .dstOffset = dst_offset,\n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h\n\
+        +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h\n@@ -321,6 +321,7 @@\n     void EmitIndexBuffer();\n\
+        \ \n     void ResetBindings(bool is_compute);\n+    void RefreshDenseBufferBindings();\n \n     bool IsComputeMetaClear(const\
+        \ Pipeline* pipeline);\n     bool IsComputeImageCopy(const Pipeline* pipeline);\n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_runtime.cpp\n\
+        +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_runtime.cpp\n@@ -4,6 +4,7 @@\n #include <boost/container/small_vector.hpp>\n\
+        \ #include \"gow3_toggles.h\"\n #include \"video_core/buffer_cache/buffer.h\"\n+#include \"video_core/buffer_cache/snapshot_copy_plan.h\"\
+        \n #include \"video_core/renderer_vulkan/liverpool_to_vk.h\"\n #include \"video_core/renderer_vulkan/vk_instance.h\"\
+        \n #include \"video_core/renderer_vulkan/vk_runtime.h\"\n@@ -113,6 +114,41 @@\n \n void Runtime::CopyBuffer(const\
+        \ VideoCore::Buffer* src, const VideoCore::Buffer* dst,\n                          std::span<const vk::BufferCopy>\
+        \ copies) {\n+    if (copies.empty()) {\n+        return;\n+    }\n+    if (src->Handle() == dst->Handle())\
+        \ {\n+        u64 src_first = ~0ULL, src_end = 0, dst_first = ~0ULL, dst_end = 0;\n+        for (const auto&\
+        \ copy : copies) {\n+            src_first = std::min(src_first, copy.srcOffset);\n+            src_end\
+        \ = std::max(src_end, copy.srcOffset + copy.size);\n+            dst_first = std::min(dst_first, copy.dstOffset);\n\
+        +            dst_end = std::max(dst_end, copy.dstOffset + copy.size);\n+        }\n+        if (src_first\
+        \ < dst_end && dst_first < src_end) {\n+            const auto plan = VideoCore::MakeSnapshotCopyPlan(copies);\n\
+        +            ASSERT_MSG(plan.size <= instance.GetMaxBufferSize(),\n+                       \"Overlapping\
+        \ buffer copy scratch exceeds the driver limit\");\n+            auto snapshot = std::make_unique<VideoCore::Buffer>(\n\
+        +                instance, 0, plan.size, VideoCore::MemoryType::DeviceLocal,\n+                \"Overlapping\
+        \ buffer copy snapshot\",\n+                vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst);\n\
+        +            CopyBuffer(src, snapshot.get(), plan.gather);\n+            if (plan.scatter_overlaps) {\n\
+        +                // Vulkan also forbids two destination regions touching the same\n+                // bytes\
+        \ in one copy command. Preserve input order across commands.\n+                for (const auto& copy : plan.scatter)\
+        \ {\n+                    CopyBuffer(snapshot.get(), dst, std::span{&copy, 1});\n+                }\n+ \
+        \           } else {\n+                CopyBuffer(snapshot.get(), dst, plan.scatter);\n+            }\n\
+        +            scheduler.DeferOperation([snapshot = std::move(snapshot)]() mutable {\n+                snapshot.reset();\n\
+        +            });\n+            return;\n+        }\n+    }\n     scheduler.EndRendering();\n \n     // gow3:\
+        \ many regions (HLE copy shaders) are tracked as one bounding range per buffer:\n--- a/gpu/shadps4/video_core/renderer_vulkan/vk_shader_hle.cpp\n\
+        +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_shader_hle.cpp\n@@ -35,6 +35,11 @@\n         src_max = std::max(src_max,\
+        \ copy.srcOffset + copy.size);\n         dst_min = std::min(dst_min, copy.dstOffset);\n         dst_max\
+        \ = std::max(dst_max, copy.dstOffset + copy.size);\n+    }\n+    // A coalesced ordinary buffer can be both\
+        \ source and destination. An\n+    // overlapping compute copy races between workgroups; use the ordered\
+        \ path.\n+    if (src == dst && src_min < dst_max && dst_min < src_max) {\n+        return false;\n    \
+        \ }\n     auto& runtime = rasterizer.GetRuntime();\n     auto& scheduler = runtime.GetScheduler();\n@@ -210,10\
+        \ +215,12 @@\n         }\n \n         // Obtain buffers for the total source and destination ranges.\n-\
+        \        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(\n+        auto [src_buf, src_buf_offset]\
+        \ = buffer_cache.ObtainBuffer(\n             src_buf_sharp.base_address + src_offset_min, src_offset_max\
+        \ - src_offset_min, false);\n-        const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(\n\
+        +        auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(\n             dst_buf_sharp.base_address\
+        \ + dst_offset_min, dst_offset_max - dst_offset_min, true);\n+        buffer_cache.ResolveDenseBinding(src_buf,\
+        \ src_buf_offset);\n+        buffer_cache.ResolveDenseBinding(dst_buf, dst_buf_offset);\n \n         //\
+        \ Apply found buffer base.\n         const auto vk_copies = std::span{copies}.subspan(batch_start, batch_end\
+        \ - batch_start);\n--- /dev/null\n+++ b/gpu/shim/gow3_gpu_init_guard.h\n@@ -0,0 +1,27 @@\n+// SPDX-License-Identifier:\
+        \ GPL-2.0-or-later\n+#pragma once\n+\n+#include <cstdio>\n+#include <exception>\n+#include <utility>\n+\n\
+        +namespace Gow3Gpu {\n+\n+// The C loader checks for a nonzero result. C++ initialization failures must\n\
+        +// become that result instead of unwinding across the C loader's entry point.\n+template <typename Initialize>\n\
+        +int GuardInitialization(Initialize&& initialize) noexcept {\n+    try {\n+        return std::forward<Initialize>(initialize)();\n\
+        +    } catch (const std::exception& error) {\n+        std::fprintf(stderr, \"GPU initialization failed:\
+        \ %s\\n\", error.what());\n+    } catch (...) {\n+        std::fputs(\"GPU initialization failed: unknown\
+        \ C++ exception\\n\", stderr);\n+    }\n+    // Keep the preceding Vulkan error and this failure visible\
+        \ in exported logs.\n+    std::fflush(stdout);\n+    std::fflush(stderr);\n+    return -1;\n+}\n+\n+} //\
+        \ namespace Gow3Gpu\n--- a/gpu/shim/gow3_settings.cpp\n+++ b/gpu/shim/gow3_settings.cpp\n@@ -205,6 +205,18\
+        \ @@\n             Set(v, key, value);\n         }\n     }\n+    if (const char* mode = std::getenv(\"GOW3_MALI_DIAGNOSTICS\"\
+        ); mode && mode[0] == '1') {\n+        // Test2 starts from synchronous, unscaled rendering. These overrides\n\
+        +        // apply to this experimental process and do not rewrite the INI file.\n+        v.upscaler = UpscalerOff;\n\
+        +        v.deferred_readback = false;\n+        v.stale_readback = false;\n+        v.async_shaders = false;\n\
+        +        v.frames_queued = 1;\n+        std::printf(\"GOW3_MALI_DIAGNOSTICS=2 (upscaler off, synchronous\
+        \ shaders/readbacks, \"\n+                    \"one queued frame; INI preserved)\\n\");\n+        std::fflush(stdout);\n\
+        +    }\n     v.startup_preset = v.preset;\n     v.startup_upscaler = v.upscaler;\n     v.startup_object_motion\
+        \ = v.object_motion;\n--- a/gpu/shim/gow3_toggles.h\n+++ b/gpu/shim/gow3_toggles.h\n@@ -87,6 +87,11 @@\n\
+        \ inline std::atomic<int> gpu_thread_clock{-1}; ///< clockid_t of the GPU command thread\n inline std::atomic<unsigned\
+        \ long> gpu_thread_id{0}; ///< Windows thread id of the GPU command thread\n inline std::atomic<std::uint64_t>\
+        \ draws{0}, dispatches{0}, submissions{0};\n+inline std::atomic<std::uint64_t> recorded_draws{0}, recorded_dispatches{0};\n\
+        +inline const bool mali_diagnostics = [] {\n+    const char* value = std::getenv(\"GOW3_MALI_DIAGNOSTICS\"\
+        );\n+    return value && value[0] == '1';\n+}();\n /// Frames the GPU command thread has started (display\
+        \ pass), for per-frame diagnostics.\n inline std::atomic<std::uint64_t> gpu_frames{0};\n /// Wall time spent\
+        \ in operations suspected of stalls (ns, all threads).\n--- a/gpu/shim/gow3gpu.cpp\n+++ b/gpu/shim/gow3gpu.cpp\n\
+        @@ -4,6 +4,7 @@\n #include \"gow3_png.h\"\n #include \"gow3_settings.h\"\n #include \"gow3_copy.h\"\n+#include\
+        \ \"gow3_gpu_init_guard.h\"\n #ifndef _WIN32\n #include <sys/resource.h>\n #endif\n@@ -227,7 +228,7 @@\n\
+        \ }\n #endif\n \n-extern \"C\" int gow3gpu_init(const Gow3GpuConfig* config) {\n+static int InitializeGpu(const\
+        \ Gow3GpuConfig* config) {\n     // native 移植标志：用于确认设备运行的是包含 081df6f 修复的 GPU 库。\n     std::printf(\"GOW3_NATIVE_FIX_081DF6F=active\\\
+        n\");\n     // native 移植标志：用于确认设备运行的是包含 195c7ab 修复的 GPU 库。\n@@ -280,6 +281,10 @@\n     return 0;\n }\n \n\
+        +extern \"C\" int gow3gpu_init(const Gow3GpuConfig* config) {\n+    return Gow3Gpu::GuardInitialization([&]\
+        \ { return InitializeGpu(config); });\n+}\n+\n namespace Libraries::Kernel { void StartKernelService();\
+        \ }\n extern \"C\" void gow3gpu_register_kernel(void) {\n     Libraries::Kernel::StartKernelService();\n\
+        --- /dev/null\n+++ b/tests/test_dense_buffer_map.cpp\n@@ -0,0 +1,173 @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n\
+        +#include <array>\n+#include <cstdint>\n+#include <cstring>\n+#include <iostream>\n+#include <memory>\n\
+        +#include <random>\n+#include <stdexcept>\n+#include <vector>\n+#include \"video_core/buffer_cache/dense_buffer_map.h\"\
+        \n+#include \"video_core/buffer_cache/snapshot_copy_plan.h\"\n+\n+namespace {\n+using U64 = std::uint64_t;\n\
+        +void Check(bool condition, const char* message) {\n+    if (!condition) throw std::runtime_error(message);\n\
+        +}\n+template <typename Error, typename Func>\n+void Rejects(Func&& operation) {\n+    bool rejected = false;\n\
+        +    try { operation(); } catch (const Error&) { rejected = true; }\n+    Check(rejected, \"Expected invalid\
+        \ operation to be rejected\");\n+}\n+struct Buffer {\n+    inline static int live{};\n+    U64 address;\n\
+        +    std::vector<std::uint8_t> bytes;\n+    Buffer(U64 address, U64 size) : address{address}, bytes(size,\
+        \ 0) { ++live; }\n+    ~Buffer() { --live; }\n+};\n+auto Allocate(U64 start, U64 size) { return std::make_unique<Buffer>(start,\
+        \ size); }\n+void Copy(const Buffer* old, Buffer* next, U64 offset, U64 size) {\n+    Check(size <= old->bytes.size()\
+        \ && offset + size <= next->bytes.size(), \"Copy bounds\");\n+    std::memcpy(next->bytes.data() + offset,\
+        \ old->bytes.data(), size);\n+}\n+using Map = VideoCore::DenseBufferMap<Buffer>;\n+\n+void MigrationAndLifetime()\
+        \ {\n+    Map map{16, 256, 1024};\n+    auto first = map.Acquire(3, 5, Allocate, Copy);\n+    Check(first.created\
+        \ && !first.migrated && map.Size() == 1, \"First allocation\");\n+    auto* old_a = first.buffer;\n+   \
+        \ old_a->bytes[6] = 91; // latest GPU-written data must survive relocation\n+    auto* old_b = map.Acquire(64,\
+        \ 8, Allocate, Copy).buffer;\n+    old_b->bytes[2] = 173;\n+    Check(map.Acquire(4, 2, Allocate, Copy).buffer\
+        \ == old_a, \"Contained request reuses buffer\");\n+    auto joined = map.Acquire(15, 50, Allocate, Copy);\n\
+        +    Check(joined.created && joined.migrated && map.Size() == 1, \"Bridge merges both ranges\");\n+    Check(joined.buffer->bytes[6]\
+        \ == 91 && joined.buffer->bytes[66] == 173,\n+          \"Preserve both old allocations\");\n+    Check(joined.buffer->bytes[32]\
+        \ == 0, \"New padding starts at zero\");\n+    const auto a = map.Resolve(old_a, 6);\n+    const auto b\
+        \ = map.Resolve(old_b, 2);\n+    Check(a.first == joined.buffer && a.second == 6, \"Refresh first old binding\"\
+        );\n+    Check(b.first == joined.buffer && b.second == 66, \"Refresh second old binding\");\n+    Check(b.second\
+        \ % 16 == 2, \"Relocation preserves descriptor alignment adjustment\");\n+    Check(Buffer::live == 3, \"\
+        Old resources survive until explicitly retired\");\n+    auto retired = map.TakeRetired();\n+    Check(retired.size()\
+        \ == 2 && Buffer::live == 3, \"Retirement transfers ownership\");\n+    retired.clear(); // stand-in for\
+        \ the completed GPU submission\n+    Check(Buffer::live == 1, \"Destroy old resources only after completion\"\
+        );\n+    Check(map.ActiveBytes() == 80, \"Account for live coalesced allocation\");\n+}\n+\n+void LimitsAndRollback()\
+        \ {\n+    Map map{16, 64, 1024};\n+    auto* first = map.Acquire(16, 4, Allocate, Copy).buffer;\n+    auto*\
+        \ adjacent = map.Acquire(32, 4, Allocate, Copy).buffer;\n+    Check(first != adjacent && map.Size() == 2,\
+        \ \"Adjacent buffers need not be joined\");\n+    Rejects<std::length_error>([&] { map.Acquire(16, 100,\
+        \ Allocate, Copy); });\n+    Check(map.Find(16) == first && map.Find(32) == adjacent, \"Limit failure preserves\
+        \ index\");\n+    const auto fail = [](U64, U64) -> std::unique_ptr<Buffer> { throw std::bad_alloc{}; };\n\
+        +    Rejects<std::bad_alloc>([&] { map.Acquire(30, 8, fail, Copy); });\n+    Check(map.Find(16) == first\
+        \ && map.Find(32) == adjacent, \"Allocator failure preserves index\");\n+    const int live = Buffer::live;\n\
+        +    const auto fail_copy = [](const Buffer*, Buffer*, U64, U64) {\n+        throw std::runtime_error(\"\
+        copy callback failed\");\n+    };\n+    Rejects<std::runtime_error>([&] { map.Acquire(30, 8, Allocate, fail_copy);\
+        \ });\n+    Check(map.Find(16) == first && map.Find(32) == adjacent && Buffer::live == live,\n+        \
+        \  \"Copy failure preserves old ownership\");\n+    Rejects<std::out_of_range>([&] { map.Acquire(0, 0, Allocate,\
+        \ Copy); });\n+    Rejects<std::out_of_range>([&] { map.Acquire(1023, 2, Allocate, Copy); });\n+    Rejects<std::out_of_range>([&]\
+        \ { map.Resolve(first, 16); });\n+    Check(!map.Find(1023, 2) && !map.Find(0, 0), \"Invalid lookups do\
+        \ not wrap\");\n+    Rejects<std::invalid_argument>([] { Map invalid{3, 64}; });\n+    Map high{64, 128};\n\
+        +    auto* top = high.Acquire((U64{1} << 40) - 1, 1, Allocate, Copy).buffer;\n+    Check(top->address ==\
+        \ (U64{1} << 40) - 64, \"Upper guest address bound\");\n+    Rejects<std::out_of_range>([&] { high.Acquire((U64{1}\
+        \ << 40) - 1, 2, Allocate, Copy); });\n+}\n+\n+void DifferentialWrites() {\n+    constexpr U64 Space = 8192;\n\
+        +    Map map{64, Space, Space};\n+    std::array<std::uint8_t, Space> reference{};\n+    struct Lease {\
+        \ const Buffer* buffer; U64 offset; U64 guest; };\n+    std::vector<Lease> saved;\n+    std::mt19937 random{0x615};\n\
+        +    for (int step = 0; step < 2000; ++step) {\n+        const U64 size = random() % 256 + 1;\n+       \
+        \ const U64 guest = random() % (Space - size + 1);\n+        auto* current = map.Acquire(guest, size, Allocate,\
+        \ Copy).buffer;\n+        saved.push_back({current, guest - current->address, guest});\n+        for (U64\
+        \ i = 0; i < size; ++i) {\n+            const auto value = static_cast<std::uint8_t>(random());\n+     \
+        \       current->bytes[guest - current->address + i] = value;\n+            reference[guest + i] = value;\n\
+        +        }\n+        // Read old bindings through the same resolver used by the rasterizer.\n+        const\
+        \ auto& lease = saved[random() % saved.size()];\n+        const auto [backing, offset] = map.Resolve(lease.buffer,\
+        \ lease.offset);\n+        Check(backing->bytes[offset] == reference[lease.guest], \"Old binding sees current\
+        \ data\");\n+        map.ForEach([&](U64 start, U64 bytes, const Buffer* buffer) {\n+            Check(std::memcmp(buffer->bytes.data(),\
+        \ reference.data() + start, bytes) == 0,\n+                  \"Differential coalescing data preservation\"\
+        );\n+        });\n+    }\n+    Check(map.Size() == 1 && map.ActiveBytes() == Space, \"Bounded final coverage\"\
+        );\n+}\n+\n+struct Region { U64 srcOffset, dstOffset, size; };\n+void SnapshotCopies() {\n+    std::array<std::uint32_t,\
+        \ 8> data{10, 20, 30, 40, 50, 60, 70, 80};\n+    const std::array<Region, 2> regions{{{0, 4, 12}, {4, 0,\
+        \ 4}}};\n+    const auto plan = VideoCore::MakeSnapshotCopyPlan(std::span<const Region>{regions});\n+  \
+        \  std::vector<std::uint8_t> snapshot(plan.size);\n+    for (const auto& copy : plan.gather) {\n+      \
+        \  std::memcpy(snapshot.data() + copy.dstOffset,\n+                    reinterpret_cast<const std::uint8_t*>(data.data())\
+        \ + copy.srcOffset, copy.size);\n+    }\n+    for (const auto& copy : plan.scatter) {\n+        std::memcpy(reinterpret_cast<std::uint8_t*>(data.data())\
+        \ + copy.dstOffset,\n+                    snapshot.data() + copy.srcOffset, copy.size);\n+    }\n+    Check(data\
+        \ == std::array<std::uint32_t, 8>{20, 10, 20, 30, 50, 60, 70, 80},\n+          \"Read all aliased sources\
+        \ before overwriting them\");\n+    const std::array<Region, 1> unaligned{{{1, 2, 3}}};\n+    const auto\
+        \ bytes = VideoCore::MakeSnapshotCopyPlan(std::span<const Region>{unaligned});\n+    Check(bytes.size ==\
+        \ 3 && bytes.gather[0].srcOffset == 1 &&\n+          bytes.scatter[0].dstOffset == 2 && !bytes.scatter_overlaps,\n\
+        +          \"Vulkan byte copies do not require dword alignment\");\n+    const std::array<Region, 2> overlap{{{0,\
+        \ 3, 5}, {8, 5, 3}}};\n+    const auto aliased = VideoCore::MakeSnapshotCopyPlan(std::span<const Region>{overlap});\n\
+        +    Check(aliased.scatter_overlaps, \"Overlapping destinations require separate commands\");\n+    const\
+        \ std::array<Region, 1> invalid{{{0, 0, 0}}};\n+    Rejects<std::invalid_argument>([&] {\n+        VideoCore::MakeSnapshotCopyPlan(std::span<const\
+        \ Region>{invalid});\n+    });\n+    const std::array<Region, 1> overflow{{{~U64{0}, 0, 1}}};\n+    Rejects<std::invalid_argument>([&]\
+        \ {\n+        VideoCore::MakeSnapshotCopyPlan(std::span<const Region>{overflow});\n+    });\n+}\n+} // namespace\n\
+        +\n+int main() {\n+    try {\n+        MigrationAndLifetime();\n+        Check(Buffer::live == 0, \"No leak\
+        \ after migration test\");\n+        LimitsAndRollback();\n+        Check(Buffer::live == 0, \"No leak after\
+        \ failure tests\");\n+        DifferentialWrites();\n+        Check(Buffer::live == 0, \"No leak after differential\
+        \ test\");\n+        SnapshotCopies();\n+        std::cout << \"Dense buffer map: migration, bindings, lifetime,\
+        \ limits, 2000 differential \"\n+                     \"write cases and snapshot copies passed\\n\";\n+\
+        \        return 0;\n+    } catch (const std::exception& error) {\n+        std::cerr << \"Dense buffer map\
+        \ test failed: \" << error.what() << '\\n';\n+        return 1;\n+    }\n+}\n--- /dev/null\n+++ b/tests/test_gpu_init_guard.cpp\n\
+        @@ -0,0 +1,48 @@\n+// SPDX-License-Identifier: GPL-2.0-or-later\n+// Host regression test; no Vulkan device,\
+        \ game files, or Android SDK required.\n+#include <cstdio>\n+#include <memory>\n+#include <stdexcept>\n\
+        +\n+#include \"gow3_gpu_init_guard.h\"\n+\n+static void Require(bool condition, const char* message) {\n\
+        +    if (!condition) {\n+        throw std::runtime_error(message);\n+    }\n+}\n+\n+int main() {\n+   \
+        \ int calls = 0;\n+    Require(Gow3Gpu::GuardInitialization([&] {\n+                ++calls;\n+        \
+        \        return 0;\n+            }) == 0,\n+            \"successful initialization must return success\"\
+        );\n+    Require(calls == 1, \"initialization must run exactly once\");\n+    Require(Gow3Gpu::GuardInitialization([]\
+        \ { return 7; }) == 7,\n+            \"explicit initialization failure must be preserved\");\n+\n+    bool\
+        \ unwound = false;\n+    bool continued = false;\n+    struct PendingResource {\n+        explicit PendingResource(bool&\
+        \ released_) : released{released_} {}\n+        bool& released;\n+        ~PendingResource() { released\
+        \ = true; }\n+    };\n+    // Throw with a non-copyable resource in scope: failure must unwind the\n+  \
+        \  // partially initialized object, skip subsequent setup, and return to C.\n+    Require(Gow3Gpu::GuardInitialization([&]()\
+        \ -> int {\n+                auto resource = std::make_unique<PendingResource>(unwound);\n+            \
+        \    throw std::runtime_error(\"test: Vulkan device initialization failed\");\n+                continued\
+        \ = true;\n+                return 0;\n+            }) == -1,\n+            \"device initialization exception\
+        \ must become failure\");\n+    Require(unwound, \"partial initialization resources must be released\");\n\
+        +    Require(!continued, \"setup must stop after failed initialization\");\n+\n+    Require(Gow3Gpu::GuardInitialization([]()\
+        \ -> int { throw 42; }) == -1,\n+            \"unknown C++ exceptions must not escape the C entry point\"\
+        );\n+    std::puts(\"GPU initialization guard: all checks passed\");\n+}\n--- a/tests/test_graphics_settings.cpp\n\
+        +++ b/tests/test_graphics_settings.cpp\n@@ -27,6 +27,7 @@\n }\n \n int main() {\n+    Env(\"GOW3_MALI_DIAGNOSTICS\"\
+        , \"\");\n     assert(G::ParseDisplayMode(\"borderless\") == G::Borderless && G::ParseDisplayMode(\"bogus\"\
+        ) == G::Windowed);\n     assert(G::ParseFpsLimit(240) == 240 && G::ParseFpsLimit(75) == 0);\n     assert(G::Resolutions[G::ParseResolution(\"\
+        1440p\")] == \"1440p\" && G::ParseResolution(\"8K\") == 0);\n@@ -134,6 +135,24 @@\n     Gow3Settings::Save();\n\
+        \     assert(Read(path).find(\"patches_CUSA01740_01_00=\\nlsfg_enabled=0\\n\") != std::string::npos);\n\
+        \     assert(Read(path).find(selection) == std::string::npos);\n+    // Test2's process-local diagnostic\
+        \ settings must override stale INI choices\n+    // without silently rewriting the user's stored configuration.\n\
+        +    {\n+        std::ofstream out(path);\n+        out << \"upscaler=fsr3\\nasync_shaders=1\\ndeferred_readback=1\\\
+        n\"\n+               \"stale_readback=1\\nframes_queued=2\\n\";\n+    }\n+    const auto before_diagnostics\
+        \ = Read(path);\n+    Env(\"GOW3_MALI_DIAGNOSTICS\", \"1\");\n+    Gow3Settings::Load();\n+    assert(v.upscaler\
+        \ == Gow3Settings::UpscalerOff && !v.async_shaders);\n+    assert(!v.deferred_readback && !v.stale_readback\
+        \ && v.frames_queued == 1);\n+    assert(!Gow3Settings::GraphicsNeedRestart());\n+    assert(Read(path)\
+        \ == before_diagnostics);\n+    Env(\"GOW3_MALI_DIAGNOSTICS\", \"\");\n+    Gow3Settings::Load();\n+   \
+        \ assert(v.upscaler == Gow3Settings::UpscalerFsr3 && v.async_shaders);\n+    assert(v.deferred_readback\
+        \ && v.stale_readback && v.frames_queued == 2);\n     std::remove(path);\n     std::puts(\"PASS: graphics\
+        \ settings\");\n }\n--- /dev/null\n+++ b/tests/test_wave64_layout.cpp\n@@ -0,0 +1,99 @@\n+// SPDX-License-Identifier:\
+        \ GPL-2.0-or-later\n+// Host reference checks; actual shader lowering/driver execution need the Android\
+        \ build.\n+#include <algorithm>\n+#include <array>\n+#include <numeric>\n+#include <cstdint>\n+#include\
+        \ <iostream>\n+#include <random>\n+#include <stdexcept>\n+#include <vector>\n+#include \"shader_recompiler/wave64_layout.h\"\
+        \n+\n+namespace {\n+using U32 = std::uint32_t;\n+using U64 = std::uint64_t;\n+void Check(bool value, const\
+        \ char* why) {\n+    if (!value) throw std::runtime_error(why);\n+}\n+\n+void CheckGroup(U32 native, U32\
+        \ threads, std::mt19937& random) {\n+    Shader::Wave64Layout layout{native};\n+    std::vector<U32> masks(layout.ScratchSlots(threads),\
+        \ 0xDEADBEEF);\n+    std::vector<U32> predicates(threads);\n+    std::vector<U32> input(threads);\n+   \
+        \ for (U32 lane = 0; lane < threads; ++lane) {\n+        predicates[lane] = random() & 1;\n+        input[lane]\
+        \ = random();\n+    }\n+    std::vector<U32> execution_order(threads);\n+    std::iota(execution_order.begin(),\
+        \ execution_order.end(), 0);\n+    std::shuffle(execution_order.begin(), execution_order.end(), random);\n\
+        +    // Physical lanes may run in a different order from guest linear indices.\n+    // Model the reset/barrier/atomic-OR/barrier\
+        \ phases independently.\n+    for (const U32 invocation : execution_order) {\n+        masks[layout.WaveFirstSlot(invocation)]\
+        \ = 0;\n+        masks[layout.WaveFirstSlot(invocation) + 1] = 0;\n+    }\n+    for (const U32 invocation\
+        \ : execution_order) {\n+        if (predicates[invocation]) {\n+            masks[layout.BallotSlot(invocation)]\
+        \ |= layout.BallotBit(invocation);\n+        }\n+    }\n+    for (U32 invocation = 0; invocation < threads;\
+        \ ++invocation) {\n+        const U32 base = layout.WaveFirstSlot(invocation);\n+        Check(base + 1\
+        \ < masks.size(), \"Scratch ballot address in bounds\");\n+        const U64 lowered = U64{masks[base]}\
+        \ | (U64{masks[base + 1]} << 32);\n+        // Independent scalar reference: one bit for each active guest\
+        \ lane.\n+        U64 reference{};\n+        const U32 first = invocation / 64 * 64;\n+        for (U32\
+        \ bit = 0; bit < 64 && first + bit < threads; ++bit) {\n+            reference |= U64{predicates[first +\
+        \ bit]} << bit;\n+        }\n+        Check(lowered == reference, \"Full logical-wave ballot, including\
+        \ partial final waves\");\n+    }\n+    // Peer-read phase reuses scratch with exactly one writer per guest\
+        \ slot.\n+    for (const U32 invocation : execution_order) {\n+        masks[layout.Slot(invocation)] =\
+        \ input[invocation];\n+    }\n+    for (U32 invocation = 0; invocation < threads; ++invocation) {\n+   \
+        \     const U32 first = invocation / 64 * 64;\n+        for (U32 source = 0; source < 64 && first + source\
+        \ < threads; ++source) {\n+            const U32 slot = layout.SourceSlot(invocation, source);\n+      \
+        \      Check(slot < masks.size(), \"Read-lane source slot in bounds\");\n+            Check(masks[slot]\
+        \ == input[first + source],\n+                  \"Read lane across every native subgroup of the logical\
+        \ wave\");\n+        }\n+    }\n+}\n+}\n+\n+int main() {\n+    try {\n+        std::mt19937 random{0x61564};\n\
+        +        U32 cases{};\n+        for (const U32 native : {4u, 8u, 16u, 32u, 64u, 128u}) {\n+            for\
+        \ (const U32 threads : {1u, 7u, 15u, 16u, 17u, 31u, 32u, 33u, 48u,\n+                                  \
+        \    63u, 64u, 65u, 80u, 96u, 127u, 128u, 129u,\n+                                      192u, 255u, 256u,\
+        \ 511u, 512u}) {\n+                CheckGroup(native, threads, random);\n+                ++cases;\n+  \
+        \          }\n+            for (int run = 0; run < 500; ++run) {\n+                CheckGroup(native, random()\
+        \ % 512 + 1, random);\n+                ++cases;\n+            }\n+        }\n+        for (const U32 invalid\
+        \ : {0u, 3u, 48u, 129u}) {\n+            bool rejected{};\n+            try { Shader::Wave64Layout layout{invalid};\
+        \ }\n+            catch (const std::invalid_argument&) { rejected = true; }\n+            Check(rejected,\
+        \ \"Reject unsupported native size\");\n+        }\n+        std::cout << \"Wave64 layout: \" << cases\n\
+        +                  << \" reference groups passed (4/8/16/32/64/128 lanes, permuted execution, partial waves\
+        \ and peer reads)\\n\";\n+    } catch (const std::exception& error) {\n+        std::cerr << error.what()\
+        \ << '\\n';\n+        return 1;\n+    }\n+}\n--- a/tools/android/build_bionic.sh\n+++ b/tools/android/build_bionic.sh\n\
+        @@ -33,7 +33,7 @@\n toolchain=$ndk/build/cmake/android.toolchain.cmake\n llvm=$(find \"$ndk/toolchains/llvm/prebuilt\"\
+        \ -maxdepth 1 -type d -name \"*x86_64\" | head -1)\n J=${GOW3_JOBS:-22}\n-run() { if command -v taskset\
+        \ >/dev/null 2>&1; then taskset -c 2-23 nice -n 19 \"$@\"; else \"$@\"; fi; }\n+run() { if command -v taskset\
+        \ >/dev/null 2>&1; then nice -n 19 \"$@\"; else \"$@\"; fi; }\n [[ -f $toolchain ]] || { echo \"No NDK:\
+        \ $ndk (tools/android/build_bionic_deps.sh)\" >&2; exit 1; }\n [[ -f $prefix/.done-ffmpeg ]] || { echo \"\
+        No Bionic deps in $prefix (tools/android/build_bionic_deps.sh)\" >&2; exit 1; }\n [[ -d $headers/share/cmake/tsl-robin-map\
+        \ ]] || { echo \"No header-only packages in $headers\" >&2; exit 1; }\n@@ -110,6 +110,7 @@\n     cp -f \"\
+        $prefix/lib/libSDL3.so\" \"$out/lib/\"\n fi\n cp -f \"$llvm/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so\"\
+        \ \"$out/lib/\"\n+cp -f \"$prefix/lib/libSDL3.so\" \"$out/lib/\"\n \n cc=(\"$llvm/bin/aarch64-linux-android$api-clang\"\
+        \ -fuse-ld=lld)\n mkdir -p \"$out/atrac9\"\n--- a/tools/android/build_bionic_deps.sh\n+++ b/tools/android/build_bionic_deps.sh\n\
+        @@ -35,7 +35,7 @@\n J=${GOW3_JOBS:-22}\n # macOS 没有 taskset；Linux 上用它限核避免拖垮机器。\n if command -v taskset >/dev/null\
+        \ 2>&1; then\n-    run() { taskset -c 2-23 nice -n 19 \"$@\"; }\n+    run() { nice -n 19 \"$@\"; }\n else\n\
+        \     run() { \"$@\"; }\n fi\n--- a/tools/android/build_jni_libs.sh\n+++ b/tools/android/build_jni_libs.sh\n\
+        @@ -34,7 +34,7 @@\n \n # The same API level the runtime is built for, so the app and the game agree on the\
+        \ platform.\n api=${GOW3_ANDROID_API:-30}\n-bin=$ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin\n+bin=$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin\n\
+        \ # C sources go through clang, C++ through clang++: clang++ would compile a .c as C++ (jni.h's\n # NewStringUTF\
+        \ is not visible to C++ that way, among others).\n clang=$bin/aarch64-linux-android$api-clang\n--- a/tools/android/debug/build_bionic_debug_apk.sh\n\
+        +++ b/tools/android/debug/build_bionic_debug_apk.sh\n@@ -40,11 +40,11 @@\n sdk=${GOW3_ANDROID_SDK:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}\n\
+        \ bt=\"$sdk/build-tools/${GOW3_BUILD_TOOLS:-35.0.0}\"\n \"$bt/apksigner\" verify \"$apk\"\n-\"$bt/aapt\"\
+        \ dump badging \"$apk\" | grep -F com.gow3.android.bionic >/dev/null\n+\"$bt/aapt\" dump badging \"$apk\"\
+        \ | grep -F \"package: name='com.gow3.android.bionic.malitest2'\" >/dev/null\n # Bionic：校验 payload 是 Bionic\
+        \ runtime 且 APK 带 libgow3present.so；glibc bridge 校验跳过。\n # 摘要比对证明包里的 payload 就是本次 staged 的那一份，而不是上次构建残留的。\n\
+        \ python3 - \"$apk\" \"$payload\" <<'PY'\n-import hashlib, pathlib, sys, zipfile\n+import hashlib, io, json,\
+        \ pathlib, sys, tarfile, zipfile\n apk, payload = sys.argv[1], sys.argv[2]\n with zipfile.ZipFile(apk) as\
+        \ z:\n     names = set(z.namelist())\n@@ -53,6 +53,9 @@\n         assert name in names, 'missing %s' % name\n\
+        \     packed = z.read('assets/runtime.payload')\n     declared = z.read('assets/runtime.sha256').decode().split()[0]\n\
+        +with tarfile.open(fileobj=io.BytesIO(packed), mode='r:gz') as runtime:\n+    manifest = json.load(runtime.extractfile('runtime-manifest.json'))\n\
+        +assert manifest['application_id'] == 'com.gow3.android.bionic.malitest2', 'debug payload application id\
+        \ mismatch'\n current = pathlib.Path(payload).read_bytes()\n assert hashlib.sha256(packed).hexdigest() ==\
+        \ hashlib.sha256(current).hexdigest(), \\\n     'APK payload does not match the staged runtime payload'\n\
+        --- a/tools/android/debug/stage_bionic_runtime.sh\n+++ b/tools/android/debug/stage_bionic_runtime.sh\n@@\
+        \ -21,6 +21,7 @@\n staging=\"$bionic_tree/gow3port\"\n archive=out/debug/runtime.bionic.tar.gz\n stamp=out/debug/runtime.bionic.inputs\n\
+        +runtime_app_id=${GOW3_RUNTIME_APP_ID:-com.gow3.android.bionic}\n \n # Every file that ends up in the payload.\
+        \ Missing entries are recorded too, so a payload is never\n # reused after an input disappears.\n@@ -36,8\
+        \ +37,10 @@\n     tools/android/config/gow3-default.ini\n     tools/android/config/gow3-gamecontrollerdb.txt\n\
+        \     tools/android/runtime/runtime-manifest.bionic.json\n+    tools/android/debug/stage_bionic_runtime.sh\n\
+        \ )\n fingerprint() {\n+    printf 'application_id  %s\\n' \"$runtime_app_id\"\n     local f\n     for f\
+        \ in \"${inputs[@]}\"; do\n         if [[ -f $f ]]; then\n@@ -76,7 +79,12 @@\n     # 补丁派生产物（boot-linked.bin、content.bin、patches.bin）不进\
+        \ payload：构建期只打包\n     # runtime 与补丁规则 XML（APK assets），玩家游戏准备与补丁实例化在运行前完成。\n     # 顶部级 roots：gow3port、home；payload\
+        \ 里带 Bionic runtime-manifest。\n-    cp -f tools/android/runtime/runtime-manifest.bionic.json \"$bionic_tree/runtime-manifest.json\"\
+        \n+    python3 - \"$bionic_tree/runtime-manifest.json\" \"$runtime_app_id\" <<'PY_MANIFEST'\n+import json,\
+        \ pathlib, sys\n+manifest = json.loads(pathlib.Path('tools/android/runtime/runtime-manifest.bionic.json').read_text())\n\
+        +manifest['application_id'] = sys.argv[2]\n+pathlib.Path(sys.argv[1]).write_text(json.dumps(manifest, indent=2)\
+        \ + '\\n')\n+PY_MANIFEST\n     # macOS 的 two-layer 元数据问题，两层都要挡：\n     #   1. cp 会在目标上留下 com.apple.provenance\
+        \ 等扩展属性；bsdtar 打包时把每个带 xattr 的\n     #      文件写成一对成员（真实文件 + ._同名 AppleDouble），payload 因此多出近一倍成员。\n--- a/tools/android/debug/stage_debug_runtime.sh\n\
+        +++ b/tools/android/debug/stage_debug_runtime.sh\n@@ -13,6 +13,8 @@\n cd -- \"$script_dir/../../..\"\n \n\
+        \ if [[ ${GOW3_BIONIC:-0} == 1 || -x out/bionic/bin/gow3-probe ]]; then\n+    # Keep the debug payload identity\
+        \ in sync with applicationIdSuffix in Gradle.\n+    export GOW3_RUNTIME_APP_ID=com.gow3.android.bionic.malitest2\n\
+        \     exec bash \"$script_dir/stage_bionic_runtime.sh\"\n fi\n \n--- a/tools/android/device/run-bionic.sh\n\
+        +++ b/tools/android/device/run-bionic.sh\n@@ -11,6 +11,7 @@\n # usage: run-bionic.sh [game|vulkan]   env\
+        \ from the app: GOW3_SCREEN_W/SCREEN_H、GOW3_GAME_DIR、\n #        GOW3_APP0_DIR、GOW3_ANDROID_INPUT=1\n set\
+        \ -eu\n+export GOW3_MALI_DIAGNOSTICS=1 GOW3_FRAME_STATS=1\n files=${FXD_FILES:-/data/user/0/com.gow3.android.bionic/files}\n\
+        \ base=\"$files/gow3port\"\n bionic=\"$base/bionic\"\n'''\ndata = patch.encode('utf-8')\nassert hashlib.sha256(data).hexdigest()\
+        \ == '40e307f64dc89e0afbb6c2b9c43e276c1830291be8d15d6d75315245f03e2f0a'\nPath('out/phone-build/panvk-mali-test2.patch').write_bytes(data)\n\
+        PY\ngit apply --check out/phone-build/panvk-mali-test2.patch\ngit apply out/phone-build/panvk-mali-test2.patch\n\
+        git diff --check\ngit diff --stat\nbash -n tools/android/build_jni_libs.sh tools/android/build_bionic.sh\
+        \ tools/android/build_bionic_deps.sh tools/android/debug/stage_debug_runtime.sh tools/android/debug/stage_bionic_runtime.sh\
+        \ tools/android/debug/build_bionic_debug_apk.sh\ng++ -std=c++23 -O2 -DNDEBUG -Wall -Wextra -Werror -I gpu/shim\
+        \ tests/test_gpu_init_guard.cpp -o out/phone-build/test_gpu_init_guard\nout/phone-build/test_gpu_init_guard\
+        \ 2>&1 | tee out/phone-build/init-guard-test.log\ng++ -std=c++23 -O2 -DNDEBUG -Wall -Wextra -Werror -I gpu/shadps4\
+        \ tests/test_dense_buffer_map.cpp -o out/phone-build/test_dense_buffer_map\nout/phone-build/test_dense_buffer_map\
+        \ 2>&1 | tee out/phone-build/dense-map-test.log\ng++ -std=c++23 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer\
+        \ -Wall -Wextra -Werror -I gpu/shadps4 tests/test_dense_buffer_map.cpp -o out/phone-build/test_dense_buffer_map_sanitized\n\
+        out/phone-build/test_dense_buffer_map_sanitized 2>&1 | tee out/phone-build/dense-map-sanitized.log\nglslangValidator\
+        \ --target-env vulkan1.3 gpu/shadps4/video_core/host_shaders/dense_buffer_probe.comp -o out/phone-build/dense-buffer-probe.spv\
+        \ 2>&1 | tee out/phone-build/probe-shader.log\nspirv-val --target-env vulkan1.3 out/phone-build/dense-buffer-probe.spv\n\
+        g++ -std=c++23 -O2 -DNDEBUG -Wall -Wextra -Werror -I gpu/shadps4 tests/test_wave64_layout.cpp -o out/phone-build/test_wave64_layout\n\
+        out/phone-build/test_wave64_layout 2>&1 | tee out/phone-build/wave64-layout-test.log\ng++ -std=c++23 -O1\
+        \ -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror -I gpu/shadps4 tests/test_wave64_layout.cpp\
+        \ -o out/phone-build/test_wave64_layout_sanitized\nout/phone-build/test_wave64_layout_sanitized 2>&1 | tee\
+        \ out/phone-build/wave64-layout-sanitized.log\ng++ -std=c++23 -O2 -UNDEBUG -Wall -Wextra -Werror -I gpu/shim\
+        \ tests/test_graphics_settings.cpp gpu/shim/gow3_settings.cpp -o out/phone-build/test_graphics_settings\n\
+        out/phone-build/test_graphics_settings 2>&1 | tee out/phone-build/settings-test.log\nglslangValidator --target-env\
+        \ vulkan1.3 gpu/shadps4/video_core/host_shaders/wave64_probe.comp -o out/phone-build/wave64-probe.spv 2>&1\
+        \ | tee out/phone-build/wave64-shader.log\nspirv-val --target-env vulkan1.3 out/phone-build/wave64-probe.spv\n"
+    - name: Check launcher SDK and library compatibility before the native build
+      run: |
+        # This checks AAR metadata without staging the not-yet-built runtime.
+        # The actual APK build later runs the staging task normally.
+        bash android-launcher/gradlew -p android-launcher                   :app:checkDebugAarMetadata --exclude-task :app:stageDebugRuntime                   --no-daemon --no-configuration-cache --stacktrace                   2>&1 | tee out/phone-build/launcher-check.log
+    - name: Install the host header dependencies
+      run: |
+        prefix="$PWD/.local-deps/root/usr"
+        sources="$PWD/.local-deps/phone-sources"
+        mkdir -p "$prefix" "$sources"
+
+        curl --fail --location --retry 3       https://github.com/boostorg/boost/releases/download/boost-1.87.0/boost-1.87.0-cmake.tar.xz       --output "$sources/boost.tar.xz"
+        tar -xf "$sources/boost.tar.xz" -C "$sources"
+        cmake -S "$sources/boost-1.87.0" -B "$sources/boost-build" -G Ninja       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix"       -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TESTING=OFF       '-DBOOST_INCLUDE_LIBRARIES=asio;container;intrusive;icl;pool;container_hash;preprocessor;headers'
+        cmake --build "$sources/boost-build" --parallel 2
+        cmake --install "$sources/boost-build"
+
+        git clone --depth 1 --branch v1.3.0 https://github.com/Tessil/robin-map.git "$sources/robin-map"
+        cmake -S "$sources/robin-map" -B "$sources/robin-build" -G Ninja       -DCMAKE_INSTALL_PREFIX="$prefix" -DBUILD_TESTING=OFF
+        cmake --install "$sources/robin-build"
+
+        git clone --depth 1 --branch v3.3.0       https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git "$sources/vma"
+        cmake -S "$sources/vma" -B "$sources/vma-build" -G Ninja       -DCMAKE_INSTALL_PREFIX="$prefix" -DVMA_BUILD_SAMPLES=OFF
+        cmake --install "$sources/vma-build"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        import os
+        prefix = Path('.local-deps/root/usr').resolve()
+        boost = list(prefix.glob('lib/cmake/Boost-*/BoostConfig.cmake'))
+        if len(boost) != 1:
+            raise SystemExit(f'Expected one installed BoostConfig.cmake, found {boost}')
+        values = {'GOW3_ARM64_HEADERS': str(prefix), 'GOW3_BOOST_DIR': str(boost[0].parent)}
+        headers = list(prefix.glob('lib/cmake/boost_headers-*/boost_headers-config.cmake'))
+        if len(headers) == 1:
+            values['GOW3_BOOST_HEADERS_DIR'] = str(headers[0].parent)
+        with open(os.environ['GITHUB_ENV'], 'a') as env:
+            for name, value in values.items():
+                env.write(f'{name}={value}\n')
+        print('Header package locations:', values)
+        PY
+    - name: Build Bionic dependencies
+      run: |
+        bash tools/android/build_bionic_deps.sh 2>&1 | tee out/phone-build/dependencies.log
+    - name: Build the CPU and GPU runtime
+      run: |
+        bash tools/android/build_bionic.sh 2>&1 | tee out/phone-build/runtime-build.log
+    - name: Build and verify the debug APK
+      run: |
+        bash tools/android/debug/build_bionic_debug_apk.sh 2>&1 | tee out/phone-build/apk-build.log
+        python3 - <<'PY'
+        from pathlib import Path
+        import hashlib
+        import shutil
+        apks = list(Path('out/debug').glob('*.apk'))
+        if len(apks) != 1:
+            raise SystemExit(f'Expected exactly one newly built APK, found {apks}')
+        output = Path('out/phone-build/apk/GOW3-Mali-PanVK-test2.apk')
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(apks[0], output)
+        digest = hashlib.sha256(output.read_bytes()).hexdigest()
+        output.with_suffix('.apk.sha256').write_text(f'{digest}  {output.name}\n')
+        print('Built:', output, 'SHA-256:', digest)
+        PY
+    - name: Save the APK and checksum
+      uses: actions/upload-artifact@v7
+      with:
+        name: GOW3-Mali-PanVK-test2-apk
+        path: out/phone-build/apk/
+        if-no-files-found: error
+        retention-days: 7
+    - name: Save diagnostics, including on failure
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: GOW3-Mali-PanVK-build-logs
+        path: |
+          out/phone-build/*.txt
+          out/phone-build/*.log
+          out/bionic/*-build.log
+          .local-deps/android/bionic-build/*.log
+          out/phone-build/*.patch
+        include-hidden-files: true
+        if-no-files-found: warn
+        retention-days: 7
